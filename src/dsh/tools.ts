@@ -1,6 +1,9 @@
 /** DSH tool definitions. Tools that change review state ask the user through `ctx.approval` first. */
-import { readFile, stat, writeFile, mkdir } from 'node:fs/promises'
-import { dirname, isAbsolute, relative, resolve } from 'node:path'
+import { readFile, readdir, stat, writeFile, mkdir } from 'node:fs/promises'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { analyze } from '../code/analyze.js'
+import { languageOf } from '../code/languages.js'
+import { qualityReport } from '../core/quality.js'
 import { searchLines } from '../core/evidence.js'
 import { toJsonLd, toTurtle } from '../core/export.js'
 import { type ObjectSetQuery, runQuery } from '../core/query.js'
@@ -36,6 +39,29 @@ export interface ToolEnv {
 
 const MAX_MATERIAL_BYTES = 5 * 1024 * 1024
 const MAX_INLINE_EXPORT = 200_000
+const MAX_CODE_FILES = 5000
+const MAX_CODE_FILE_BYTES = 1024 * 1024
+/** Directories never worth scanning. */
+const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'out', 'target', 'vendor', '.venv', 'venv', '__pycache__', '.next', 'coverage'])
+
+/** Collect supported source files under `root`, skipping generated and dependency folders. */
+async function collectSources(root: string, workspace: string, limit: number) {
+  const files: Array<{ path: string; text: string }> = []
+  const skipped: Array<{ path: string; reason: string }> = []
+  const walk = async (dir: string): Promise<void> => {
+    for (const entry of (await readdir(dir, { withFileTypes: true })).sort((a, b) => (a.name < b.name ? -1 : 1))) {
+      if (files.length >= limit) return
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) { if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith('.')) await walk(full); continue }
+      if (!entry.isFile() || !languageOf(entry.name)) continue
+      const path = relative(workspace, full).split('\\').join('/')
+      if ((await stat(full)).size > MAX_CODE_FILE_BYTES) { skipped.push({ path, reason: 'larger than 1 MB' }); continue }
+      files.push({ path, text: await readFile(full, 'utf8') })
+    }
+  }
+  await walk(root)
+  return { files, skipped, truncated: files.length >= limit }
+}
 
 const str = (description: string) => ({ type: 'string', description })
 const obj = (properties: Record<string, unknown>, required: string[] = [], description?: string) => ({ type: 'object', properties, required, additionalProperties: false, ...(description ? { description } : {}) })
@@ -460,6 +486,83 @@ export function createTools(env: ToolEnv): ToolSpec[] {
           }
           default: throw new Error(`Unknown action ${args.action}.`)
         }
+      }
+    },
+    {
+      name: 'ontology_code_scan',
+      description: 'Analyze source code under a workspace directory into the built-in code sub-ontology: modules, symbols (classes, functions, methods…), imports and calls, using tree-sitter (TypeScript, JavaScript, Python, Go, Java, Rust). Each file is stored as a read-only material so code facts can be cited. Calls are resolved by name only; ambiguous ones are left out. Each scan is a new snapshot.',
+      timeoutMs: 10 * 60 * 1000,
+      parameters: obj({ project, path: str('Directory inside the workspace to scan (default: workspace root).') }, ['project']),
+      async execute(args) {
+        const s = store()
+        const id = s.project(String(args.project)).id
+        const root = inWorkspace(String(args.path ?? '.'))
+        const { files, skipped, truncated } = await collectSources(root, env.workspace, MAX_CODE_FILES)
+        if (!files.length) throw new Error('No supported source files found.')
+        const graph = await analyze(files)
+        graph.skipped.push(...skipped)
+        const snap = s.addCodeSnapshot(id, relative(env.workspace, root) || '.', files, graph)
+        return { ...snap, truncated, skipped: graph.skipped.slice(0, 20) }
+      }
+    },
+    {
+      name: 'ontology_code_search',
+      description: 'Search the latest code snapshot. `symbols` finds classes/functions/methods by name fragment; `neighbors` lists imports and calls into and out of one module path or symbol ref (path#Container.name); `links` lists links between ontology objects and code.',
+      parameters: obj({ project, action: { type: 'string', enum: ['symbols', 'neighbors', 'links'] }, text: str('Name fragment (symbols).'), kind: { type: 'string', enum: ['class', 'interface', 'type', 'enum', 'function', 'method'] }, module: str('Limit to one module path (symbols).'), ref: str('Module path or symbol ref (neighbors).'), objectId: str('Limit links to one object (links).'), limit: { type: 'integer' } }, ['project', 'action']),
+      async execute(args) {
+        const s = store()
+        const id = s.project(String(args.project)).id
+        const limit = Math.min(Math.max(1, Math.floor(Number(args.limit ?? 50))), 200)
+        if (args.action === 'neighbors') return s.codeNeighbors(id, String(args.ref ?? ''), limit)
+        if (args.action === 'links') return { links: s.codeLinks(id, { objectId: args.objectId ? String(args.objectId) : undefined, status: ['candidate', 'confirmed'] }).slice(0, limit) }
+        return s.searchCode(id, { text: args.text ? String(args.text) : undefined, kind: args.kind ? String(args.kind) : undefined, module: args.module ? String(args.module) : undefined, limit })
+      }
+    },
+    {
+      name: 'ontology_code_link',
+      description: 'Propose links from ontology objects to code elements (e.g. a Service implementedBy a class). The code element must exist in the latest snapshot; its declaration line becomes observed evidence automatically, and you may add document quotes too. Links are candidates; confirm them with ontology_review_commit.',
+      parameters: obj({
+        project,
+        extractor: str('Who proposed these, e.g. "agent:code-pass-1".'),
+        links: arr(obj({ objectId: str('Ontology object id.'), codeRef: str('Module path or symbol ref from ontology_code_search.'), relation: str('camelCase relation, e.g. implementedBy, definedIn, testedBy.'), quote: str('Optional exact code text to cite instead of the declaration line.'), evidence: evidenceList }, ['objectId', 'codeRef', 'relation']))
+      }, ['project', 'extractor', 'links']),
+      async execute(args) {
+        const s = store()
+        const r = s.assertCodeLinks(s.project(String(args.project)).id, String(args.extractor ?? 'agent'), Array.isArray(args.links) ? args.links : [])
+        return { ...r, failed: r.results.filter(x => x.outcome === 'failed').length }
+      }
+    },
+    {
+      name: 'ontology_question',
+      description: 'Competency questions as regression tests. `set` saves the ObjectSet query that answers a question (same shape as ontology_query) and what counts as answered (minimum result count, keys that must appear). `run` executes all saved queries on confirmed data and flags questions that passed before and fail now.',
+      parameters: obj({
+        project, action: { type: 'string', enum: ['set', 'run'] },
+        questionId: str('Question id from the schema (set).'),
+        query: obj({ objectType: str('Starting object type.'), where: filterParam, traverse: arr(obj({ link: str('Traversal name.'), where: filterParam }, ['link'])), aggregate: obj({ groupBy: str('Property.'), metric: { type: 'string', enum: ['count', 'sum', 'avg', 'min', 'max'] }, property: str('Numeric property.') }, ['metric']) }, ['objectType']),
+        expect: obj({ minResults: { type: 'integer', description: 'Answered when at least this many results.' }, includes: arr({ type: 'string' }, 'Primary keys that must be in the result.') }, ['minResults'])
+      }, ['project', 'action']),
+      async execute(args) {
+        const s = store()
+        const id = s.project(String(args.project)).id
+        if (args.action === 'set') { s.setQuestionQuery(id, String(args.questionId), args.query, args.expect); return { saved: args.questionId } }
+        const results = s.runQuestions(id)
+        return { results, regressions: results.filter(r => r.regression).map(r => r.questionId) }
+      }
+    },
+    {
+      name: 'ontology_quality',
+      description: 'Quality report for the published version: structure, logic (confirmed data vs schema), evidence, modelling smells, competency-question coverage (runs saved queries) and extraction quality (review acceptance, rule spot-check accuracy). `ready` is true when nothing blocks.',
+      parameters: obj({ project, path: str('Optional workspace file to write the full JSON report to.') }, ['project']),
+      async execute(args) {
+        const s = store()
+        const report = qualityReport(s, s.project(String(args.project)).id)
+        if (args.path) {
+          const full = inWorkspace(String(args.path))
+          await mkdir(dirname(full), { recursive: true })
+          await writeFile(full, JSON.stringify(report, null, 2))
+          return { path: full, summary: report.summary, questions: { mustAnswered: report.questions.mustAnswered, mustTotal: report.questions.mustTotal, regressions: report.questions.regressions } }
+        }
+        return report
       }
     },
     {

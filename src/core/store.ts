@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
-import { findQuote } from './evidence.js'
-import { type Filter, compileFilter } from './query.js'
+import type { CodeGraph } from '../code/analyze.js'
+import { findQuote, lineAt } from './evidence.js'
+import { type Filter, type ObjectSetQuery, compileFilter, runQuery } from './query.js'
 import { type Named, normalizeKey, suggestDuplicates } from './resolve.js'
 import { type Issue, type LinkTypeDef, type ObjectTypeDef, type OntologySchema, emptySchema, normalizeSchema, validateProperties, validateSchema } from './schema.js'
 
@@ -43,6 +44,8 @@ export interface RuleDefinition {
 export interface Rule { id: string; definition: RuleDefinition; status: 'active' | 'disabled'; disabledReason: string | null; createdAt: string }
 export interface RuleStats { confirmed: number; samples: number; judged: number; correct: number; accuracy: number | null }
 export interface ExtractionRun { materialId: string; chunkStart: number; chunkEnd: number; chunkSha256: string; promptVersion: string; provider: string; model: string; attempts: number; output: unknown; problems: unknown }
+export interface QuestionExpectation { minResults: number; includes?: string[] }
+export interface QuestionResult { questionId: string; text: string; priority: string; status: 'pass' | 'fail' | 'error' | 'no-query'; total?: number; missing?: string[]; error?: string; regression: boolean }
 export interface Conflict { field: string; kept: unknown; other: unknown; batchId: string | null }
 
 export interface Project { id: string; name: string; description: string; createdAt: string }
@@ -93,6 +96,17 @@ CREATE TABLE IF NOT EXISTS rules (id TEXT PRIMARY KEY, project_id TEXT NOT NULL 
   authorization TEXT NOT NULL, disabled_reason TEXT, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS rule_samples (rule_id TEXT NOT NULL REFERENCES rules(id), target_id TEXT NOT NULL, verdict TEXT CHECK (verdict IN ('correct', 'wrong')), note TEXT,
   created_at TEXT NOT NULL, judged_at TEXT, PRIMARY KEY (rule_id, target_id));
+CREATE TABLE IF NOT EXISTS code_snapshots (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), root TEXT NOT NULL, files INTEGER NOT NULL, stats TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS code_modules (snapshot_id TEXT NOT NULL REFERENCES code_snapshots(id), path TEXT NOT NULL, language TEXT NOT NULL, material_id TEXT NOT NULL REFERENCES materials(id), lines INTEGER NOT NULL, PRIMARY KEY (snapshot_id, path));
+CREATE TABLE IF NOT EXISTS code_symbols (snapshot_id TEXT NOT NULL REFERENCES code_snapshots(id), qualified_name TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, module TEXT NOT NULL, container TEXT,
+  start_offset INTEGER NOT NULL, end_offset INTEGER NOT NULL, line INTEGER NOT NULL, PRIMARY KEY (snapshot_id, qualified_name));
+CREATE INDEX IF NOT EXISTS code_symbols_name ON code_symbols (snapshot_id, name);
+CREATE TABLE IF NOT EXISTS code_edges (snapshot_id TEXT NOT NULL REFERENCES code_snapshots(id), kind TEXT NOT NULL CHECK (kind IN ('imports', 'calls')), source TEXT NOT NULL, target TEXT NOT NULL,
+  start_offset INTEGER NOT NULL, end_offset INTEGER NOT NULL, line INTEGER NOT NULL, PRIMARY KEY (snapshot_id, kind, source, target));
+CREATE TABLE IF NOT EXISTS code_links (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), object_id TEXT NOT NULL REFERENCES objects(id), code_ref TEXT NOT NULL, relation TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('candidate', 'confirmed', 'rejected')), batch_id TEXT NOT NULL REFERENCES batches(id), decision TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (project_id, object_id, code_ref, relation));
+CREATE TABLE IF NOT EXISTS question_queries (project_id TEXT NOT NULL REFERENCES projects(id), question_id TEXT NOT NULL, query TEXT NOT NULL, expect TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (project_id, question_id));
+CREATE TABLE IF NOT EXISTS question_runs (seq INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, question_id TEXT NOT NULL, schema_version INTEGER, result TEXT NOT NULL, passed INTEGER NOT NULL, at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, at TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL);
 CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON audit BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
@@ -114,7 +128,7 @@ export function canonicalJson(value: unknown): string {
 
 /** Stable pseudo-random value in [0, 1) per rule and record, so sampling is reproducible. */
 const sampleScore = (ruleId: string, id: string) => parseInt(createHash('sha256').update(`${ruleId}:${id}`).digest('hex').slice(0, 8), 16) / 0x100000000
-const tableOf = (id: string) => (id.startsWith('obj_') ? 'objects' : 'links')
+const tableOf = (id: string) => (id.startsWith('obj_') ? 'objects' : id.startsWith('cln_') ? 'code_links' : 'links')
 const parseJson = (value: unknown) => JSON.parse(String(value))
 
 function assertAuthorized(auth: Authorization) {
@@ -463,6 +477,13 @@ export class Store {
           droppedLinks++
         } else this.run('UPDATE links SET from_id = ?, to_id = ?, updated_at = ? WHERE id = ?', from, to, at, String(link.id))
       }
+      for (const link of this.all('SELECT id, code_ref, relation FROM code_links WHERE object_id = ?', dropId)) {
+        const twin = this.get('SELECT id FROM code_links WHERE object_id = ? AND code_ref = ? AND relation = ?', keepId, String(link.code_ref), String(link.relation))
+        if (twin) {
+          this.run('UPDATE evidence SET target_id = ? WHERE target_id = ?', String(twin.id), String(link.id))
+          this.run('DELETE FROM code_links WHERE id = ?', String(link.id))
+        } else this.run('UPDATE code_links SET object_id = ?, updated_at = ? WHERE id = ?', keepId, at, String(link.id))
+      }
       this.run('UPDATE aliases SET object_id = ? WHERE object_id = ?', keepId, dropId)
       this.run("INSERT OR REPLACE INTO aliases (project_id, type, norm_key, object_id, origin, created_at) VALUES (?, ?, ?, ?, 'merge', ?)", projectId, String(keep.type), normalizeKey(String(drop.key)), keepId, at)
       this.run('DELETE FROM merges WHERE object_id = ?', dropId)
@@ -472,6 +493,185 @@ export class Store {
       this.audit(projectId, 'resolve.merge', { keepId, dropId, dropKey: drop.key, conflicts, droppedLinks, authorization: auth })
       return { keepId, dropId, alias: String(drop.key), conflicts, droppedLinks }
     })
+  }
+
+  /**
+   * Store one code analysis. Each source file becomes a read-only material, so
+   * code facts carry the same verifiable evidence as document facts. Snapshots
+   * are append-only; the latest one is what queries and checks use.
+   */
+  addCodeSnapshot(projectId: string, root: string, files: Array<{ path: string; text: string }>, graph: CodeGraph): { snapshotId: string; materials: { created: number; reused: number }; stats: Record<string, number> } {
+    return this.tx(() => {
+      const id = newId('snp')
+      const at = now()
+      const materialOf = new Map<string, string>()
+      let created = 0
+      for (const f of files) {
+        if (!graph.modules.some(m => m.path === f.path)) continue
+        const hash = sha256(f.text)
+        const existing = this.get('SELECT id FROM materials WHERE project_id = ? AND sha256 = ?', projectId, hash)
+        const mid = existing ? String(existing.id) : newId('mat')
+        if (!existing) {
+          this.run('INSERT INTO materials (id, project_id, name, sha256, text, created_at) VALUES (?, ?, ?, ?, ?, ?)', mid, projectId, `code:${f.path}`, hash, f.text, at)
+          created++
+        }
+        materialOf.set(f.path, mid)
+      }
+      const textOf = new Map(files.map(f => [f.path, f.text]))
+      const line = (path: string, offset: number) => lineAt(textOf.get(path) ?? '', offset)
+      const stats = { modules: graph.modules.length, symbols: graph.symbols.length, imports: graph.imports.length, calls: graph.calls.length, skipped: graph.skipped.length }
+      this.run('INSERT INTO code_snapshots (id, project_id, root, files, stats, created_at) VALUES (?, ?, ?, ?, ?, ?)', id, projectId, root, files.length, JSON.stringify(stats), at)
+      for (const m of graph.modules) this.run('INSERT INTO code_modules (snapshot_id, path, language, material_id, lines) VALUES (?, ?, ?, ?, ?)', id, m.path, m.language, materialOf.get(m.path)!, m.lines)
+      for (const s of graph.symbols) {
+        this.run('INSERT INTO code_symbols (snapshot_id, qualified_name, name, kind, module, container, start_offset, end_offset, line) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          id, s.qualifiedName, s.name, s.kind, s.module, s.container, s.line.start, s.line.end, line(s.module, s.line.start))
+      }
+      for (const [kind, edges] of [['imports', graph.imports], ['calls', graph.calls]] as const) {
+        for (const e of edges) {
+          const module = e.from.split('#')[0]
+          this.run('INSERT OR IGNORE INTO code_edges (snapshot_id, kind, source, target, start_offset, end_offset, line) VALUES (?, ?, ?, ?, ?, ?, ?)', id, kind, e.from, e.to, e.line.start, e.line.end, line(module, e.line.start))
+        }
+      }
+      this.audit(projectId, 'code.snapshot', { id, root, files: files.length, materials: { created, reused: materialOf.size - created }, stats })
+      return { snapshotId: id, materials: { created, reused: materialOf.size - created }, stats }
+    })
+  }
+
+  latestSnapshot(projectId: string): { id: string; root: string; createdAt: string; stats: Record<string, number> } | undefined {
+    const row = this.get('SELECT id, root, stats, created_at FROM code_snapshots WHERE project_id = ? ORDER BY rowid DESC LIMIT 1', projectId)
+    return row && { id: String(row.id), root: String(row.root), createdAt: String(row.created_at), stats: parseJson(row.stats) }
+  }
+
+  private codeRefExists(projectId: string, ref: string): boolean {
+    return this.codeElement(projectId, ref) !== undefined
+  }
+
+  /** Code element in the latest snapshot, with the material and span that prove it exists. */
+  codeElement(projectId: string, ref: string): { ref: string; kind: string; module: string; materialId: string; start: number; end: number; line: number } | undefined {
+    const snap = this.latestSnapshot(projectId)
+    if (!snap) return undefined
+    if (ref.includes('#')) {
+      const r = this.get('SELECT s.*, m.material_id FROM code_symbols s JOIN code_modules m ON m.snapshot_id = s.snapshot_id AND m.path = s.module WHERE s.snapshot_id = ? AND s.qualified_name = ?', snap.id, ref)
+      return r && { ref, kind: String(r.kind), module: String(r.module), materialId: String(r.material_id), start: Number(r.start_offset), end: Number(r.end_offset), line: Number(r.line) }
+    }
+    const r = this.get('SELECT material_id FROM code_modules WHERE snapshot_id = ? AND path = ?', snap.id, ref)
+    return r && { ref, kind: 'module', module: ref, materialId: String(r.material_id), start: 0, end: 0, line: 1 }
+  }
+
+  /** Search the latest snapshot's symbols by name fragment. */
+  searchCode(projectId: string, query: { text?: string; kind?: string; module?: string; limit: number }) {
+    const snap = this.latestSnapshot(projectId)
+    if (!snap) throw new Error('No code snapshot; run ontology_code_scan first.')
+    const like = `%${(query.text ?? '').replace(/[%_\\]/g, c => `\\${c}`)}%`
+    const symbols = this.all(`SELECT qualified_name, name, kind, module, container, line FROM code_symbols WHERE snapshot_id = ? AND (name LIKE ? ESCAPE '\\' OR qualified_name LIKE ? ESCAPE '\\')
+      AND (? IS NULL OR kind = ?) AND (? IS NULL OR module = ?) ORDER BY length(name), qualified_name LIMIT ?`, snap.id, like, like, query.kind ?? null, query.kind ?? null, query.module ?? null, query.module ?? null, query.limit)
+    return { snapshotId: snap.id, symbols: symbols.map(r => ({ ref: String(r.qualified_name), name: String(r.name), kind: String(r.kind), module: String(r.module), container: r.container === null ? null : String(r.container), line: Number(r.line) })) }
+  }
+
+  /** Imports/calls touching one code element, in either direction. */
+  codeNeighbors(projectId: string, ref: string, limit: number) {
+    const snap = this.latestSnapshot(projectId)
+    if (!snap) throw new Error('No code snapshot; run ontology_code_scan first.')
+    const rows = (dir: 'source' | 'target') => this.all(`SELECT kind, source, target, line FROM code_edges WHERE snapshot_id = ? AND ${dir} = ? ORDER BY kind, ${dir === 'source' ? 'target' : 'source'} LIMIT ?`, snap.id, ref, limit)
+    const map = (r: Row) => ({ kind: String(r.kind), source: String(r.source), target: String(r.target), line: Number(r.line) })
+    return { outgoing: rows('source').map(map), incoming: rows('target').map(map) }
+  }
+
+  /**
+   * Propose links from ontology objects to code elements. The evidence is the
+   * code itself (role `observed`), located in the file's material. The link
+   * stays a candidate until reviewed like any other.
+   */
+  assertCodeLinks(projectId: string, extractor: string, items: Array<{ objectId: string; codeRef: string; relation: string; quote?: string; evidence?: EvidenceInput[] }>): { batchId: string; results: ItemResult[] } {
+    const published = this.published(projectId)
+    if (!published) throw new Error('Publish a schema version first.')
+    const batchId = newId('bat')
+    const at = now()
+    return this.tx(() => {
+      this.run('INSERT INTO batches (id, project_id, extractor, schema_version, created_at) VALUES (?, ?, ?, ?, ?)', batchId, projectId, extractor, published.version, at)
+      const results = items.map((item, index): ItemResult => {
+        const issues: Issue[] = []
+        const object = this.get('SELECT status FROM objects WHERE project_id = ? AND id = ?', projectId, String(item?.objectId))
+        if (!object) issues.push(issue('UNKNOWN_OBJECT', 'objectId', `No object "${item?.objectId}".`))
+        else if (object.status === 'rejected') issues.push(issue('REJECTED_ENDPOINT', 'objectId', 'Object was rejected.'))
+        const element = this.codeElement(projectId, String(item?.codeRef))
+        if (!element) issues.push(issue('UNKNOWN_CODE_REF', 'codeRef', `"${item?.codeRef}" is not in the latest code snapshot; use ontology_code_search.`))
+        if (typeof item?.relation !== 'string' || !/^[a-z][a-zA-Z]*$/.test(item.relation)) issues.push(issue('INVALID_RELATION', 'relation', 'relation must be a camelCase word, e.g. implementedBy.'))
+        if (issues.length) return { index, outcome: 'failed', issues }
+        // By default the evidence is the symbol's own declaration line.
+        const text = String(this.get('SELECT text FROM materials WHERE id = ?', element!.materialId)!.text)
+        const own = item.quote !== undefined || element!.end > element!.start
+          ? [{ materialId: element!.materialId, quote: item.quote ?? text.slice(element!.start, element!.end), role: 'observed' as EvidenceRole, near: element!.start }]
+          : []
+        const evidence = this.checkEvidence(projectId, [...own, ...(item.evidence ?? [])], field => field === undefined, issues)
+        if (issues.some(i => i.severity === 'blocking')) return { index, outcome: 'failed', issues }
+        const existing = this.get('SELECT id, status FROM code_links WHERE project_id = ? AND object_id = ? AND code_ref = ? AND relation = ?', projectId, item.objectId, item.codeRef, item.relation)
+        if (existing?.status === 'rejected') return { index, outcome: 'failed', id: String(existing.id), issues: [issue('PREVIOUSLY_REJECTED', 'link', 'This code link was rejected before.')] }
+        const id = existing ? String(existing.id) : newId('cln')
+        if (!existing) this.run("INSERT INTO code_links (id, project_id, object_id, code_ref, relation, status, batch_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'candidate', ?, ?, ?)", id, projectId, item.objectId, item.codeRef, item.relation, batchId, at, at)
+        this.insertEvidence(projectId, batchId, id, evidence, at)
+        return { index, outcome: existing ? 'merged' : 'created', id, issues }
+      })
+      this.audit(projectId, 'code.link', { batchId, extractor, results: tally(results) })
+      return { batchId, results }
+    })
+  }
+
+  codeLinks(projectId: string, filter: { objectId?: string; status?: Status[] } = {}): Array<{ id: string; objectId: string; codeRef: string; relation: string; status: Status; batchId: string; stale: boolean }> {
+    const statuses = filter.status?.length ? filter.status : ['candidate', 'confirmed']
+    const marks = statuses.map(() => '?').join(', ')
+    return this.all(`SELECT * FROM code_links WHERE project_id = ? AND (? IS NULL OR object_id = ?) AND status IN (${marks}) ORDER BY rowid`, projectId, filter.objectId ?? null, filter.objectId ?? null, ...statuses)
+      .map(r => ({ id: String(r.id), objectId: String(r.object_id), codeRef: String(r.code_ref), relation: String(r.relation), status: r.status as Status, batchId: String(r.batch_id), stale: !this.codeRefExists(projectId, String(r.code_ref)) }))
+  }
+
+  /** Save the ObjectSet query that answers a competency question, and what counts as answered. */
+  setQuestionQuery(projectId: string, questionId: string, query: ObjectSetQuery, expect: QuestionExpectation) {
+    const schema = this.published(projectId)?.schema
+    if (!schema) throw new Error('Publish a schema version first.')
+    if (!schema.questions.some(q => q.id === questionId)) throw new Error(`Question "${questionId}" is not in the published schema.`)
+    if (!Number.isInteger(expect?.minResults) || expect.minResults < 0) throw new Error('expect.minResults must be an integer ≥ 0.')
+    if (expect.includes !== undefined && (!Array.isArray(expect.includes) || expect.includes.some(k => typeof k !== 'string'))) throw new Error('expect.includes must list primary keys as strings.')
+    // Fail early on a query that cannot run against the schema.
+    runQuery({ schema, objects: [], links: [] }, { ...query, status: ['confirmed'] })
+    this.tx(() => {
+      this.run('INSERT OR REPLACE INTO question_queries (project_id, question_id, query, expect, updated_at) VALUES (?, ?, ?, ?, ?)', projectId, questionId, JSON.stringify(query), JSON.stringify(expect), now())
+      this.audit(projectId, 'question.query', { questionId, query, expect })
+    })
+  }
+
+  /**
+   * Run every saved question query against confirmed data and record the
+   * outcome. A question that passed in its previous run and fails now is a
+   * regression.
+   */
+  runQuestions(projectId: string): QuestionResult[] {
+    const published = this.published(projectId)
+    if (!published) throw new Error('No published schema.')
+    const data = { schema: published.schema, objects: this.objects(projectId, { status: ['confirmed'] }), links: this.links(projectId, { status: ['confirmed'] }) }
+    const saved = new Map(this.all('SELECT question_id, query, expect FROM question_queries WHERE project_id = ?', projectId).map(r => [String(r.question_id), { query: parseJson(r.query) as ObjectSetQuery, expect: parseJson(r.expect) as QuestionExpectation }]))
+    return this.tx(() => published.schema.questions.map((q): QuestionResult => {
+      const entry = saved.get(q.id)
+      const base = { questionId: q.id, text: q.text, priority: q.priority }
+      if (!entry) return { ...base, status: 'no-query', regression: false }
+      const previous = this.get('SELECT passed FROM question_runs WHERE project_id = ? AND question_id = ? ORDER BY seq DESC LIMIT 1', projectId, q.id)
+      let outcome: Pick<QuestionResult, 'status' | 'total' | 'missing' | 'error'>
+      try {
+        const result = runQuery(data, { ...entry.query, status: ['confirmed'], limit: 500 })
+        const keys = 'objects' in result ? result.objects.map(o => o.key) : []
+        const missing = (entry.expect.includes ?? []).filter(k => !keys.includes(k))
+        outcome = { status: result.total >= entry.expect.minResults && !missing.length ? 'pass' : 'fail', total: result.total, missing }
+      } catch (error) {
+        outcome = { status: 'error', error: (error as Error).message }
+      }
+      const passed = outcome.status === 'pass'
+      this.run('INSERT INTO question_runs (project_id, question_id, schema_version, result, passed, at) VALUES (?, ?, ?, ?, ?, ?)', projectId, q.id, published.version, JSON.stringify(outcome), passed ? 1 : 0, now())
+      return { ...base, ...outcome, regression: !passed && Number(previous?.passed) === 1 }
+    }))
+  }
+
+  /** Problems left after the final attempt of every logged extraction chunk. */
+  droppedByValidation(projectId: string): number {
+    return Number(this.get('SELECT coalesce(sum(json_array_length(problems)), 0) AS n FROM extraction_runs WHERE project_id = ?', projectId)?.n ?? 0)
   }
 
   /** Store a rule the user approved. A rule only ever widens confirmation; it cannot skip the confirm checks. */
@@ -676,7 +876,17 @@ export class Store {
       decide(id, issues)
     }
     const pending: Array<{ from: string; to: string; def: LinkTypeDef }> = []
-    for (const id of ids.filter(id => !id.startsWith('obj_'))) {
+    for (const id of ids.filter(id => id.startsWith('cln_'))) {
+      const row = this.get('SELECT object_id, code_ref, status FROM code_links WHERE project_id = ? AND id = ?', projectId, id)
+      if (!row) { decide(id, [issue('UNKNOWN_RECORD', 'id', `No code link "${id}".`)]); continue }
+      if (row.status !== 'candidate') { decide(id, [issue('NOT_CANDIDATE', 'status', `Code link is already ${row.status}.`)]); continue }
+      const issues = evidenceIssues(id)
+      const status = this.get('SELECT status FROM objects WHERE id = ?', String(row.object_id))?.status
+      if (status !== 'confirmed' && !objectsReady.has(String(row.object_id))) issues.push(issue('ENDPOINT_NOT_CONFIRMED', 'object', `Confirm object ${row.object_id} first or in the same call.`))
+      if (!this.codeRefExists(projectId, String(row.code_ref))) issues.push(issue('STALE_CODE_REF', 'codeRef', `${row.code_ref} is not in the latest code snapshot.`))
+      decide(id, issues)
+    }
+    for (const id of ids.filter(id => !id.startsWith('obj_') && !id.startsWith('cln_'))) {
       const row = this.get('SELECT link_type, from_id, to_id, status FROM links WHERE project_id = ? AND id = ?', projectId, id)
       if (!row) { decide(id, [issue('UNKNOWN_RECORD', 'id', `No object or link "${id}".`)]); continue }
       if (row.status !== 'candidate') { decide(id, [issue('NOT_CANDIDATE', 'status', `Link is already ${row.status}.`)]); continue }
@@ -728,10 +938,10 @@ export class Store {
       }
       // Candidate links hanging off a rejected object go with it; confirmed ones would be left dangling.
       for (const id of rejected.filter(id => id.startsWith('obj_'))) {
-        for (const link of this.all("SELECT id FROM links WHERE project_id = ? AND status = 'candidate' AND (from_id = ? OR to_id = ?)", projectId, id, id)) {
+        for (const link of this.all("SELECT id FROM links WHERE project_id = ? AND status = 'candidate' AND (from_id = ? OR to_id = ?) UNION SELECT id FROM code_links WHERE project_id = ? AND status = 'candidate' AND object_id = ?", projectId, id, id, projectId, id)) {
           if (!rejected.includes(String(link.id))) rejected.push(String(link.id))
         }
-        if (this.get("SELECT 1 FROM links WHERE project_id = ? AND status = 'confirmed' AND (from_id = ? OR to_id = ?)", projectId, id, id)) throw new Error(`Object ${id} has confirmed links.`)
+        if (this.get("SELECT 1 FROM links WHERE project_id = ? AND status = 'confirmed' AND (from_id = ? OR to_id = ?) UNION SELECT 1 FROM code_links WHERE project_id = ? AND status = 'confirmed' AND object_id = ?", projectId, id, id, projectId, id)) throw new Error(`Object ${id} has confirmed links.`)
       }
       this.setStatus(projectId, rejected, 'rejected', { ...auth, note })
       this.audit(projectId, 'review.reject', { ids: rejected, skipped, note, authorization: auth })
@@ -755,15 +965,16 @@ export class Store {
   rollbackBatch(projectId: string, batchId: string): { objects: number; links: number; evidence: number } {
     return this.tx(() => {
       if (!this.get('SELECT 1 FROM batches WHERE project_id = ? AND id = ?', projectId, batchId)) throw new Error(`Unknown batch "${batchId}".`)
-      const touchedConfirmed = this.get(`SELECT 1 FROM evidence e LEFT JOIN objects o ON o.id = e.target_id LEFT JOIN links l ON l.id = e.target_id
-        WHERE e.project_id = ? AND e.batch_id = ? AND (o.status = 'confirmed' OR l.status = 'confirmed')`, projectId, batchId)
+      const touchedConfirmed = this.get(`SELECT 1 FROM evidence e LEFT JOIN objects o ON o.id = e.target_id LEFT JOIN links l ON l.id = e.target_id LEFT JOIN code_links c ON c.id = e.target_id
+        WHERE e.project_id = ? AND e.batch_id = ? AND (o.status = 'confirmed' OR l.status = 'confirmed' OR c.status = 'confirmed')`, projectId, batchId)
       if (touchedConfirmed) throw new Error('Batch added evidence to confirmed records; it cannot be rolled back.')
       const created = this.all('SELECT id FROM objects WHERE project_id = ? AND batch_id = ?', projectId, batchId).map(r => String(r.id))
-      const foreign = this.get(`SELECT id FROM links WHERE project_id = ? AND batch_id != ? AND (from_id IN (SELECT id FROM objects WHERE batch_id = ?) OR to_id IN (SELECT id FROM objects WHERE batch_id = ?))`, projectId, batchId, batchId, batchId)
+      const foreign = this.get(`SELECT id FROM links WHERE project_id = ? AND batch_id != ? AND (from_id IN (SELECT id FROM objects WHERE batch_id = ?) OR to_id IN (SELECT id FROM objects WHERE batch_id = ?))
+        UNION SELECT id FROM code_links WHERE project_id = ? AND batch_id != ? AND object_id IN (SELECT id FROM objects WHERE batch_id = ?)`, projectId, batchId, batchId, batchId, projectId, batchId, batchId)
       if (foreign) throw new Error(`Link ${foreign.id} from another batch depends on objects created here; roll that batch back first.`)
       if (this.get('SELECT 1 FROM entity_merges, json_each(entity_merges.batches) WHERE project_id = ? AND json_each.value = ?', projectId, batchId)) throw new Error('Records from this batch were merged with others; it can no longer be rolled back.')
       if (this.get('SELECT 1 FROM conflicts WHERE project_id = ? AND batch_id = ? AND resolution IS NOT NULL', projectId, batchId)) throw new Error('A conflict raised by this batch was already resolved; it can no longer be rolled back.')
-      const borrowed = this.get(`SELECT batch_id FROM evidence WHERE project_id = ? AND batch_id != ? AND target_id IN (SELECT id FROM objects WHERE batch_id = ? UNION SELECT id FROM links WHERE batch_id = ?)`, projectId, batchId, batchId, batchId)
+      const borrowed = this.get(`SELECT batch_id FROM evidence WHERE project_id = ? AND batch_id != ? AND target_id IN (SELECT id FROM objects WHERE batch_id = ? UNION SELECT id FROM links WHERE batch_id = ? UNION SELECT id FROM code_links WHERE batch_id = ?)`, projectId, batchId, batchId, batchId, batchId)
       if (borrowed) throw new Error(`Batch ${borrowed.batch_id} also has evidence on records created here (for example after a merge); roll that batch back first.`)
       const later = this.get(`SELECT e.batch_id FROM evidence e JOIN batches b ON b.id = e.batch_id WHERE e.project_id = ? AND e.batch_id != ? AND b.rowid > (SELECT rowid FROM batches WHERE id = ?)
         AND e.target_id IN (SELECT target_id FROM evidence WHERE batch_id = ?)`, projectId, batchId, batchId, batchId)
@@ -778,6 +989,7 @@ export class Store {
       const links = Number(this.get('SELECT count(*) AS n FROM links WHERE project_id = ? AND batch_id = ?', projectId, batchId)?.n)
       this.run('DELETE FROM evidence WHERE project_id = ? AND batch_id = ?', projectId, batchId)
       this.run('DELETE FROM links WHERE project_id = ? AND batch_id = ?', projectId, batchId)
+      this.run('DELETE FROM code_links WHERE project_id = ? AND batch_id = ?', projectId, batchId)
       this.run('DELETE FROM objects WHERE project_id = ? AND batch_id = ?', projectId, batchId)
       this.audit(projectId, 'batch.rollback', { batchId, objects: created.length, links, evidence })
       return { objects: created.length, links, evidence }

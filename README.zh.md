@@ -4,7 +4,7 @@
 
 从结构化数据、文档和源码构建可信的本体：一个参照 Palantir 本体理念的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件。
 
-> 状态：0.2（M2）。可以用 DSH 中已配置的模型抽取文档；重复实体、取值冲突和经批准的确认规则都有完整审计。代码分析和可视化界面在 0.3/0.4 提供。详见[设计文档](docs/DESIGN.md)。
+> 状态：0.3（M3）。可以用 DSH 中已配置的模型抽取文档，把源码分析成代码子本体并与本体对象关联，能力问题作为回归测试纳入质量报告。可视化界面在 0.4 提供。详见[设计文档](docs/DESIGN.md)。
 
 ## 工具
 
@@ -23,6 +23,11 @@
 | `ontology_rule` | 预览、批准、执行确认规则；抽样复核；准确率过低时规则自动停用 |
 | `ontology_query` | ObjectSet 查询：过滤、沿链接遍历、聚合 |
 | `ontology_export` | 导出 Turtle（OWL + SHACL + PROV）或 JSON-LD |
+| `ontology_code_scan` | 用 tree-sitter 分析源码（TS/JS/Python/Go/Java/Rust），得到模块、符号、导入和调用；文件作为可引用的材料存入 |
+| `ontology_code_search` | 查找符号、列出导入/调用邻居、列出对象与代码的关联 |
+| `ontology_code_link` | 提议对象与代码的关联（如 `implementedBy`），以代码本身为证据 |
+| `ontology_question` | 为每个能力问题保存回答它的查询，并全部作为回归测试运行 |
+| `ontology_quality` | 六层质量报告：结构、逻辑、证据、建模异味、能力问题覆盖、抽取质量 |
 | `ontology_audit` | 只追加的审计日志 |
 
 发布、确认、驳回、合并、裁决冲突、批准规则都走 DSH 的审批服务。没有人能应答时（无头运行，或会话审批策略为 `never`），变更会被拒绝。规则只能确认通过全部常规检查的候选，不接受 inferred 证据，并且总会抽样复核。
@@ -40,7 +45,7 @@
 dsh plugin --profile <name> add dsh-ontology-builder
 ```
 
-需要 Node.js ≥ 22.13（使用内置 `node:sqlite`）。
+需要 Node.js ≥ 22.13（使用内置 `node:sqlite`）。代码分析使用可选依赖 `@vscode/tree-sitter-wasm`（MIT，WebAssembly，无需本地编译），没有它其余功能照常可用。
 
 ## 配置
 

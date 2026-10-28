@@ -1,6 +1,6 @@
 {
   "name": "dsh-ontology-builder",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Build trustworthy ontologies from data, documents and code — a Palantir-style ontology builder plugin for DeepSeek Harness",
   "keywords": [
     "ontology",
@@ -69,5 +69,8 @@
     "@types/node": "22.15.30",
     "n3": "2.13.12",
     "typescript": "5.9.3"
+  },
+  "optionalDependencies": {
+    "@vscode/tree-sitter-wasm": "0.3.1"
   }
 }

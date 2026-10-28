@@ -4,7 +4,7 @@ English | [中文](README.zh.md)
 
 Build trustworthy ontologies from data, documents and code — a Palantir-style ontology builder plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 
-> Status: 0.2 (M2). Documents can be extracted with the model configured in DSH; duplicates, conflicting values and approved confirmation rules are handled with full audit. Code analysis and the visual UI come in 0.3/0.4. See the [design document](docs/DESIGN.md) (Chinese).
+> Status: 0.3 (M3). Documents are extracted with the model configured in DSH, source code is analyzed into a code sub-ontology and linked to ontology objects, and competency questions run as regression tests in a quality report. The visual UI comes in 0.4. See the [design document](docs/DESIGN.md) (Chinese).
 
 ## Tools
 
@@ -23,6 +23,11 @@ Build trustworthy ontologies from data, documents and code — a Palantir-style 
 | `ontology_rule` | Preview, approve and apply confirmation rules; spot-check samples; low accuracy disables a rule |
 | `ontology_query` | ObjectSet query: filter, traverse links, aggregate |
 | `ontology_export` | Turtle (OWL + SHACL + PROV) or JSON-LD |
+| `ontology_code_scan` | Analyze source code (TS/JS/Python/Go/Java/Rust, tree-sitter) into modules, symbols, imports and calls; files become citable materials |
+| `ontology_code_search` | Find symbols, list import/call neighbours, list object↔code links |
+| `ontology_code_link` | Propose object↔code links (e.g. `implementedBy`), evidenced by the code itself |
+| `ontology_question` | Save the query that answers each competency question; run them all as regression tests |
+| `ontology_quality` | Six-layer quality report: structure, logic, evidence, smells, question coverage, extraction quality |
 | `ontology_audit` | Append-only audit log |
 
 Publishing, confirming, rejecting, merging, resolving conflicts and approving rules go through DSH's approval service. If no one can answer (headless runs, or the session's approval policy is `never`), the change is refused. A rule only confirms candidates that pass every normal check, never on inferred evidence, and always queues spot checks.
@@ -40,7 +45,7 @@ Publishing, confirming, rejecting, merging, resolving conflicts and approving ru
 dsh plugin --profile <name> add dsh-ontology-builder
 ```
 
-Requires Node.js ≥ 22.13 (uses the built-in `node:sqlite`).
+Requires Node.js ≥ 22.13 (uses the built-in `node:sqlite`). Code analysis uses the optional dependency `@vscode/tree-sitter-wasm` (MIT, WebAssembly, no native build); everything else works without it.
 
 ## Configuration
 
