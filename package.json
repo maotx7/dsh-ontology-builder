@@ -67,6 +67,7 @@
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.4",
     "@types/node": "22.15.30",
+    "n3": "2.13.12",
     "typescript": "5.9.3"
   }
 }

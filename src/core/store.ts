@@ -433,7 +433,7 @@ export class Store {
       const created = this.all('SELECT id FROM objects WHERE project_id = ? AND batch_id = ?', projectId, batchId).map(r => String(r.id))
       const foreign = this.get(`SELECT id FROM links WHERE project_id = ? AND batch_id != ? AND (from_id IN (SELECT id FROM objects WHERE batch_id = ?) OR to_id IN (SELECT id FROM objects WHERE batch_id = ?))`, projectId, batchId, batchId, batchId)
       if (foreign) throw new Error(`Link ${foreign.id} from another batch depends on objects created here; roll that batch back first.`)
-      const later = this.get(`SELECT e.batch_id FROM evidence e JOIN batches b ON b.id = e.batch_id WHERE e.project_id = ? AND e.batch_id != ? AND b.created_at >= (SELECT created_at FROM batches WHERE id = ?)
+      const later = this.get(`SELECT e.batch_id FROM evidence e JOIN batches b ON b.id = e.batch_id WHERE e.project_id = ? AND e.batch_id != ? AND b.rowid > (SELECT rowid FROM batches WHERE id = ?)
         AND e.target_id IN (SELECT target_id FROM evidence WHERE batch_id = ?)`, projectId, batchId, batchId, batchId)
       if (later) throw new Error(`Batch ${later.batch_id} later added to the same records; roll that batch back first.`)
       for (const merge of this.all('SELECT object_id, before FROM merges WHERE batch_id = ?', batchId)) {
@@ -454,8 +454,8 @@ export class Store {
     const statuses = filter.status?.length ? filter.status : ['candidate', 'confirmed']
     const marks = statuses.map(() => '?').join(', ')
     const rows = filter.type
-      ? this.all(`SELECT id, type, key, properties, status, batch_id FROM objects WHERE project_id = ? AND type = ? AND status IN (${marks}) ORDER BY created_at, id`, projectId, filter.type, ...statuses)
-      : this.all(`SELECT id, type, key, properties, status, batch_id FROM objects WHERE project_id = ? AND status IN (${marks}) ORDER BY created_at, id`, projectId, ...statuses)
+      ? this.all(`SELECT id, type, key, properties, status, batch_id FROM objects WHERE project_id = ? AND type = ? AND status IN (${marks}) ORDER BY rowid`, projectId, filter.type, ...statuses)
+      : this.all(`SELECT id, type, key, properties, status, batch_id FROM objects WHERE project_id = ? AND status IN (${marks}) ORDER BY rowid`, projectId, ...statuses)
     return rows.map(r => ({ id: String(r.id), type: String(r.type), key: String(r.key), properties: JSON.parse(String(r.properties)), status: r.status as Status, batchId: String(r.batch_id) }))
   }
 
@@ -463,13 +463,13 @@ export class Store {
     const statuses = filter.status?.length ? filter.status : ['candidate', 'confirmed']
     const marks = statuses.map(() => '?').join(', ')
     const rows = filter.linkType
-      ? this.all(`SELECT id, link_type, from_id, to_id, status, batch_id FROM links WHERE project_id = ? AND link_type = ? AND status IN (${marks}) ORDER BY created_at, id`, projectId, filter.linkType, ...statuses)
-      : this.all(`SELECT id, link_type, from_id, to_id, status, batch_id FROM links WHERE project_id = ? AND status IN (${marks}) ORDER BY created_at, id`, projectId, ...statuses)
+      ? this.all(`SELECT id, link_type, from_id, to_id, status, batch_id FROM links WHERE project_id = ? AND link_type = ? AND status IN (${marks}) ORDER BY rowid`, projectId, filter.linkType, ...statuses)
+      : this.all(`SELECT id, link_type, from_id, to_id, status, batch_id FROM links WHERE project_id = ? AND status IN (${marks}) ORDER BY rowid`, projectId, ...statuses)
     return rows.map(r => ({ id: String(r.id), linkType: String(r.link_type), fromId: String(r.from_id), toId: String(r.to_id), status: r.status as Status, batchId: String(r.batch_id) }))
   }
 
   evidence(projectId: string, targetId: string): EvidenceRecord[] {
-    return this.all('SELECT * FROM evidence WHERE project_id = ? AND target_id = ? ORDER BY created_at, id', projectId, targetId).map(r => ({
+    return this.all('SELECT * FROM evidence WHERE project_id = ? AND target_id = ? ORDER BY rowid', projectId, targetId).map(r => ({
       id: String(r.id), targetId: String(r.target_id), field: r.field === null ? null : String(r.field), materialId: String(r.material_id),
       start: Number(r.start_offset), end: Number(r.end_offset), line: Number(r.line), quote: String(r.quote), match: String(r.match), role: r.role as EvidenceRole, batchId: String(r.batch_id)
     }))
