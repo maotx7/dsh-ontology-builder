@@ -1,0 +1,72 @@
+{
+  "name": "dsh-ontology-builder",
+  "version": "0.0.1",
+  "description": "Build trustworthy ontologies from data, documents and code — a Palantir-style ontology builder plugin for DeepSeek Harness",
+  "keywords": [
+    "ontology",
+    "ontology-builder",
+    "knowledge-graph",
+    "entity-extraction",
+    "palantir",
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis"
+  ],
+  "license": "Apache-2.0",
+  "author": "maotx7",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maotx7/dsh-ontology-builder.git"
+  },
+  "bugs": {
+    "url": "https://github.com/maotx7/dsh-ontology-builder/issues"
+  },
+  "homepage": "https://github.com/maotx7/dsh-ontology-builder#readme",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "packageManager": "pnpm@9.15.9",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm build && node --test 'test/**/*.test.mjs'"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.4"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.4",
+    "@types/node": "22.15.30",
+    "typescript": "5.9.3"
+  }
+}

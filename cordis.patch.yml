@@ -1,0 +1,8 @@
+# The configuration layer this bundle contributes when a profile lists it.
+# Override any key from your own profile `cordis.patch.yml`.
+- insert:
+    - id: ontology-builder
+      name: dsh-ontology-builder
+      config:
+        # SQLite database file for ontology projects.
+        databasePath: ontology-builder.db
