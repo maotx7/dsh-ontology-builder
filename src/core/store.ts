@@ -1021,6 +1021,23 @@ export class Store {
     }))
   }
 
+  /** Every evidence span cited from one material with its target's status, for reading the material with extractions highlighted. */
+  materialEvidence(projectId: string, materialId: string): Array<EvidenceRecord & { status: Status }> {
+    return this.all(`SELECT e.*, COALESCE(o.status, l.status, c.status, 'candidate') AS status FROM evidence e
+      LEFT JOIN objects o ON o.id = e.target_id LEFT JOIN links l ON l.id = e.target_id LEFT JOIN code_links c ON c.id = e.target_id
+      WHERE e.project_id = ? AND e.material_id = ? ORDER BY e.start_offset, e.rowid`, projectId, materialId).map(r => ({
+      id: String(r.id), targetId: String(r.target_id), field: r.field === null ? null : String(r.field), materialId: String(r.material_id),
+      start: Number(r.start_offset), end: Number(r.end_offset), line: Number(r.line), quote: String(r.quote), match: String(r.match), role: r.role as EvidenceRole, batchId: String(r.batch_id),
+      status: r.status as Status
+    }))
+  }
+
+  /** Published schema versions, oldest first. */
+  schemaVersions(projectId: string): SchemaVersion[] {
+    return this.all('SELECT version, schema, hash, note, created_at FROM schema_versions WHERE project_id = ? ORDER BY version', projectId)
+      .map(row => ({ version: Number(row.version), schema: JSON.parse(String(row.schema)), hash: String(row.hash), note: String(row.note), createdAt: String(row.created_at) }))
+  }
+
   auditLog(projectId: string, limit = 50): Array<{ seq: number; at: string; action: string; detail: unknown }> {
     return this.all('SELECT seq, at, action, detail FROM audit WHERE project_id = ? ORDER BY seq DESC LIMIT ?', projectId, limit)
       .map(r => ({ seq: Number(r.seq), at: String(r.at), action: String(r.action), detail: JSON.parse(String(r.detail)) }))

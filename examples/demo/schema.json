@@ -1,0 +1,21 @@
+{
+  "questions": [
+    { "id": "q_owner", "text": "Which team owns each service?", "priority": "must" },
+    { "id": "q_tier1", "text": "Which tier-1 services exist?", "priority": "should" },
+    { "id": "q_deps", "text": "What does a service depend on?", "priority": "should" }
+  ],
+  "objectTypes": [
+    {
+      "apiName": "Team", "displayName": "Team", "primaryKey": "name", "titleProperty": "name", "questions": ["q_owner"],
+      "properties": [{ "apiName": "name", "type": "string", "required": true }]
+    },
+    {
+      "apiName": "Service", "displayName": "Service", "primaryKey": "name", "titleProperty": "name", "questions": ["q_owner", "q_tier1", "q_deps"],
+      "properties": [{ "apiName": "name", "type": "string", "required": true }, { "apiName": "tier", "type": "integer" }]
+    }
+  ],
+  "linkTypes": [
+    { "apiName": "owner", "inverseApiName": "services", "from": "Service", "to": "Team", "cardinality": "many-to-one", "questions": ["q_owner"] },
+    { "apiName": "dependsOn", "inverseApiName": "dependents", "from": "Service", "to": "Service", "cardinality": "many-to-many", "questions": ["q_deps"] }
+  ]
+}

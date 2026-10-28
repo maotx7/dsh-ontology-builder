@@ -42,7 +42,9 @@ function fakeContext(answer = 'allowed-once', replies = []) {
     approval: { async request(req) { asked.push(req); return typeof answer === 'function' ? answer(req) : answer } },
     llm: fakeLlm(replies),
     agentDefaultModel: { currentSelection: () => ({ provider: 'fake', model: 'fake-1' }) },
-    effect(fn) { disposers.push(fn()) }
+    effect(fn) { disposers.push(fn()) },
+    // Headless: no web server, so the UI route is never registered.
+    inject() {}
   }
 }
 

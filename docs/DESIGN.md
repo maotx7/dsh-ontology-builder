@@ -120,7 +120,8 @@ src/
   core/         元模型、检查器、存储（node:sqlite）、ObjectSet、导入导出 —— 不引用 DSH
   extract/      材料解析、schema 提议、抽取、核验、消歧 —— 通过参数接收 LLM 调用函数
   dsh/          工具定义、审批与模型适配
-  client/       UI（0.4 引入）
+  web/          只读 UI 数据接口与静态资源服务（/ontology）
+client/         UI 源码（React + React Flow + Cytoscape.js），构建到 dist/ui
 ```
 
 - 存储：Node 22 内置 `node:sqlite`（含 FTS5），零原生依赖；数据库路径由配置给出。
@@ -136,7 +137,15 @@ src/
 | 证据阅读器 | 打开原文，高亮被抽取片段，点击跳转对象 | React |
 | 质量与版本 | 六层检查、能力问题覆盖、版本 diff | React |
 
-未确认内容以虚线 / 半透明显示。发布前逐个核实所选库的许可证。
+未确认内容以虚线 / 半透明显示。所选库均为 MIT。
+
+实现（0.4）：
+
+- 插件在 `webServer` 与 `connection` 服务存在时（`dsh --profile web`）注册 `/ontology` 前缀路由；headless / tui 下不注册，`ontology_ui` 返回不可用提示。
+- 每个请求先过 `connection.requestRejection`（Host/Origin 校验 + 登录 cookie），与 DSH 界面同一道防线。
+- UI 只读：数据接口只提供查询，不提供任何确认、拒绝、合并、发布入口。UI 上的操作按钮只复制一段请求，用户贴回对话，由工具调用经 `ctx.approval` 执行。这样审批记录只有一个来源，UI 不会成为绕过审批的通道。
+- 边看边建：UI 每 3 秒查询审计日志的最新序号，变化时各视图重新拉取。后台批次的暂停 / 中止留待后续版本。
+- 前端源码在 `client/`，Vite 构建到 `dist/ui` 随包发布，运行时无新增依赖。
 
 ## 8. 里程碑
 

@@ -1,6 +1,6 @@
 {
   "name": "dsh-ontology-builder",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Build trustworthy ontologies from data, documents and code — a Palantir-style ontology builder plugin for DeepSeek Harness",
   "keywords": [
     "ontology",
@@ -35,6 +35,7 @@
   },
   "files": [
     "dist",
+    "examples",
     "cordis.patch.yml",
     "README.md",
     "README.zh.md",
@@ -54,8 +55,10 @@
     "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.json && vite build --config client/vite.config.ts",
+    "build:server": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p client/tsconfig.json",
+    "dev:ui": "vite --config client/vite.config.ts",
     "test": "pnpm build && node --test 'test/**/*.test.mjs'"
   },
   "dependencies": {
@@ -65,10 +68,19 @@
     "@deepseek-ai/cordis": "^4.0.4"
   },
   "devDependencies": {
+    "@dagrejs/dagre": "3.1.3",
     "@deepseek-ai/cordis": "4.0.4",
     "@types/node": "22.15.30",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "@xyflow/react": "12.12.0",
+    "cytoscape": "3.34.4",
     "n3": "2.13.12",
-    "typescript": "5.9.3"
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typescript": "5.9.3",
+    "vite": "8.3.5"
   },
   "optionalDependencies": {
     "@vscode/tree-sitter-wasm": "0.3.1"

@@ -1,10 +1,20 @@
 import { mkdirSync } from 'node:fs'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { Store } from './core/store.js'
 import { type Llm, type ModelSelection, createModel } from './dsh/model.js'
 import { type Approval, type Exec, createTools } from './dsh/tools.js'
+import { UI_PATH, createUiHandler } from './web/server.js'
+
+/** Minimal shape of the DSH web server (`@deepseek-ai/dsh-host-webserver`). */
+interface WebServer {
+  readonly host: string
+  readonly port: number
+  register(route: { kind: 'exact' | 'prefix'; path: string; handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void> }): () => void
+}
 
 export const name = 'ontology-builder'
 export const inject = ['tools', 'approval', 'llm', 'agentDefaultModel']
@@ -66,6 +76,33 @@ export function apply(ctx: Context, config: Config) {
     store?.close()
     store = undefined
   })
+  // The UI only exists where DSH serves a browser surface (`dsh --profile web`); headless runs skip it.
+  let server: WebServer | undefined
+  const uiUrl = () => server && `http://${server.host === '0.0.0.0' ? '127.0.0.1' : server.host}:${server.port}${UI_PATH}/`
+  ctx.inject(['webServer', 'connection'], (webCtx) => {
+    const web = webCtx as unknown as { webServer: WebServer; connection: { requestRejection(req: IncomingMessage): number | undefined } }
+    const handler = createUiHandler({ store: open, uiDir: fileURLToPath(new URL('./ui', import.meta.url)), reject: req => web.connection.requestRejection(req) })
+    webCtx.effect(() => {
+      const dispose = web.webServer.register({ kind: 'prefix', path: UI_PATH, handler })
+      server = web.webServer
+      return () => {
+        dispose()
+        server = undefined
+      }
+    })
+  })
+  ctx.effect(() => services.tools.register({
+    name: 'ontology_ui',
+    description: 'Get the address of the read-only ontology UI (schema graph, instance explorer, review queue with evidence, material reader, quality and versions). Only available under the DSH web surface. Changes are still made through the other tools.',
+    parameters: { type: 'object', properties: { project: { type: 'string', description: 'Project name or id to open.' } }, additionalProperties: false },
+    output: { schema: { type: 'object' }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) {
+      const base = uiUrl()
+      if (!base) return { available: false, hint: 'The UI needs the DSH web surface. Start DSH with `dsh --profile web` (with this plugin installed in that profile) and ask again.' }
+      const project = (args as { project?: string }).project
+      return { available: true, url: project ? `${base}?project=${encodeURIComponent(project)}` : base, note: 'Open it in the browser where the DSH web GUI is already signed in.' }
+    }
+  }))
   const model = createModel(services.llm, () => services.agentDefaultModel.currentSelection(), config.extraction.maxTokens)
   for (const tool of createTools({ store: open, approval: services.approval, model, extraction: config.extraction, workspace })) {
     ctx.effect(() => services.tools.register({
