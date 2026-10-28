@@ -5,7 +5,32 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as plugin from '../dist/index.js'
 
-function fakeContext(answer = 'allowed-once') {
+/** Fake ctx.llm: each call pops the next scripted reply ({ call } or { text }). */
+export function fakeLlm(replies) {
+  const requests = []
+  return {
+    requests,
+    async *stream(options) {
+      requests.push(options)
+      const reply = replies.shift() ?? { text: 'nothing' }
+      if (reply.call) {
+        const args = JSON.stringify(reply.call)
+        yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+        yield { type: 'tool-call-delta', index: 0, id: 'tc1', name: 'submit_extraction', argumentsDelta: args.slice(0, 10) }
+        yield { type: 'tool-call-delta', index: 0, id: 'tc1', argumentsDelta: args.slice(10) }
+        yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'tc1', name: 'submit_extraction', arguments: args } }
+        yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      } else if (reply.fail) {
+        yield { type: 'finish', reason: { kind: 'error', failure: { message: reply.fail, code: 'X' } } }
+      } else {
+        yield { type: 'text-delta', index: 0, text: reply.text }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      }
+    }
+  }
+}
+
+function fakeContext(answer = 'allowed-once', replies = []) {
   const registered = new Map()
   const disposers = []
   const asked = []
@@ -15,6 +40,8 @@ function fakeContext(answer = 'allowed-once') {
     dispose: () => disposers.reverse().forEach(d => d?.()),
     tools: { register(definition) { registered.set(definition.name, definition); return () => registered.delete(definition.name) } },
     approval: { async request(req) { asked.push(req); return typeof answer === 'function' ? answer(req) : answer } },
+    llm: fakeLlm(replies),
+    agentDefaultModel: { currentSelection: () => ({ provider: 'fake', model: 'fake-1' }) },
     effect(fn) { disposers.push(fn()) }
   }
 }
@@ -40,14 +67,14 @@ const SCHEMA = {
 
 test('exports a Cordis plugin shape', () => {
   assert.equal(plugin.name, 'ontology-builder')
-  assert.deepEqual(plugin.inject, ['tools', 'approval'])
+  assert.deepEqual(plugin.inject, ['tools', 'approval', 'llm', 'agentDefaultModel'])
   assert.equal(typeof plugin.apply, 'function')
   assert.equal(plugin.Config({}).databasePath, 'ontology-builder.db')
 })
 
 test('end-to-end build through the tools', withWorkspace(async dir => {
   const ctx = fakeContext()
-  plugin.apply(ctx, { databasePath: 'state/onto.db' })
+  plugin.apply(ctx, plugin.Config({ databasePath: 'state/onto.db' }))
   const call = (name, args, e = exec) => ctx.registered.get(name).execute(args, e)
   for (const tool of ctx.registered.values()) assert.equal(tool.parameters.type, 'object', tool.name)
 
@@ -95,9 +122,66 @@ test('end-to-end build through the tools', withWorkspace(async dir => {
   ctx.dispose()
 }))
 
+test('ontology_extract runs the configured model and records located candidates', withWorkspace(async () => {
+  const doc = 'Service catalogue\n\nThe billing service (tier 1) is owned by the Payments team.\nPayments is led by Kim.\n'
+  const replies = [
+    // First attempt: one fabricated quote, so the tool must send it back.
+    { call: { objects: [
+      { type: 'Service', properties: { name: 'billing', tier: 1 }, quote: 'billing service (tier 1)' },
+      { type: 'Team', properties: { name: 'Payments', lead: 'Kim' }, quote: 'Payments is managed by Kim' }
+    ], links: [] } },
+    { call: { objects: [
+      { type: 'Service', properties: { name: 'billing', tier: 1 }, quote: 'billing service (tier 1)' },
+      { type: 'Team', properties: { name: 'Payments', lead: 'Kim' }, quote: 'Payments is led by Kim', fieldQuotes: { lead: 'led by Kim' } }
+    ], links: [{ linkType: 'owner', from: { type: 'Service', key: 'billing' }, to: { type: 'Team', key: 'Payments' }, quote: 'owned by the Payments team' }] } }
+  ]
+  const ctx = fakeContext('allowed-once', replies)
+  plugin.apply(ctx, plugin.Config({ databasePath: 'onto.db' }))
+  const call = (name, args, e = exec) => ctx.registered.get(name).execute(args, e)
+  assert.equal(ctx.registered.get('ontology_extract').timeoutMs, 30 * 60 * 1000)
+  await call('ontology_project', { action: 'create', name: 'p' })
+  await call('ontology_schema', { action: 'draft', project: 'p', schema: SCHEMA })
+  await call('ontology_schema_publish', { project: 'p' })
+  const mat = (await call('ontology_material_add', { project: 'p', text: doc, name: 'catalogue.md' })).material
+
+  const plan = await call('ontology_extract', { project: 'p', materialIds: [mat.id], dryRun: true })
+  assert.equal(plan.materials[0].chunks, 1)
+  assert.equal(ctx.llm.requests.length, 0)
+
+  const r = await call('ontology_extract', { project: 'p', materialIds: [mat.id] })
+  assert.equal(r.model, 'fake/fake-1')
+  assert.deepEqual([r.objects.created, r.links.created], [2, 1])
+  assert.deepEqual(r.droppedByValidation, [])
+  assert.equal(ctx.llm.requests.length, 2)
+  const req = ctx.llm.requests[1]
+  assert.deepEqual([req.provider, req.model, req.temperature, req.tools[0].name], ['fake', 'fake-1', 0, 'submit_extraction'])
+  assert.match(req.messages[0].content[0].text, /not in the passage/)
+
+  const preview = await call('ontology_review_preview', { project: 'p', batchId: r.batchId })
+  const team = preview.items.find(i => i.key === 'Payments')
+  assert.deepEqual(team.evidence.map(e => [e.line, e.quote, e.field]), [[4, 'Payments is led by Kim', null], [4, 'led by Kim', 'lead']])
+  const audit = await call('ontology_audit', { project: 'p' })
+  assert.equal(audit.entries[0].action, 'batch.assert')
+  assert.equal(audit.entries[0].detail.extractor, 'llm:fake/fake-1')
+  ctx.dispose()
+}))
+
+test('ontology_extract surfaces model failures', withWorkspace(async () => {
+  const ctx = fakeContext('allowed-once', [{ fail: 'invalid api key' }])
+  plugin.apply(ctx, plugin.Config({ databasePath: 'onto.db' }))
+  const call = (name, args) => ctx.registered.get(name).execute(args, exec)
+  await call('ontology_project', { action: 'create', name: 'p' })
+  await call('ontology_schema', { action: 'draft', project: 'p', schema: SCHEMA })
+  await call('ontology_schema_publish', { project: 'p' })
+  const mat = (await call('ontology_material_add', { project: 'p', text: 'The billing service.' })).material
+  await assert.rejects(call('ontology_extract', { project: 'p', materialIds: [mat.id] }), /invalid api key/)
+  assert.equal((await call('ontology_project', { action: 'get', project: 'p' })).objects.candidate, 0)
+  ctx.dispose()
+}))
+
 test('changes stop when the user does not approve', withWorkspace(async () => {
   const ctx = fakeContext('rejected')
-  plugin.apply(ctx, { databasePath: 'onto.db' })
+  plugin.apply(ctx, plugin.Config({ databasePath: 'onto.db' }))
   const call = (name, args, e = exec) => ctx.registered.get(name).execute(args, e)
   await call('ontology_project', { action: 'create', name: 'p' })
   await call('ontology_schema', { action: 'draft', project: 'p', schema: SCHEMA })
@@ -109,7 +193,7 @@ test('changes stop when the user does not approve', withWorkspace(async () => {
 
 test('publishing reports blocking issues without asking', withWorkspace(async () => {
   const ctx = fakeContext()
-  plugin.apply(ctx, { databasePath: 'onto.db' })
+  plugin.apply(ctx, plugin.Config({ databasePath: 'onto.db' }))
   const call = (name, args) => ctx.registered.get(name).execute(args, exec)
   await call('ontology_project', { action: 'create', name: 'p' })
   await call('ontology_schema', { action: 'draft', project: 'p', schema: { objectTypes: [{ apiName: 'A', primaryKey: 'x', properties: [] }] } })

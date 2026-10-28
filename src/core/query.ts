@@ -36,7 +36,7 @@ export function runQuery(data: QueryData, query: ObjectSetQuery): QueryResult {
 
   let currentType = requireType(types, query.objectType)
   let current = visible.filter(o => o.type === currentType)
-  if (query.where) current = current.filter(compile(query.where, propertiesOf(data.schema, currentType)))
+  if (query.where) current = current.filter(compileFilter(query.where, propertiesOf(data.schema, currentType)))
 
   for (const step of query.traverse ?? []) {
     const forward = data.schema.linkTypes.find(l => l.from === currentType && l.apiName === step.link)
@@ -52,7 +52,7 @@ export function runQuery(data: QueryData, query: ObjectSetQuery): QueryResult {
     }
     currentType = forward ? def.to : def.from
     current = [...next].map(id => byId.get(id)!).filter(o => o.type === currentType)
-    if (step.where) current = current.filter(compile(step.where, propertiesOf(data.schema, currentType)))
+    if (step.where) current = current.filter(compileFilter(step.where, propertiesOf(data.schema, currentType)))
   }
 
   if (query.aggregate) return { objectType: currentType, total: current.length, groups: aggregate(current, query.aggregate, propertiesOf(data.schema, currentType)) }
@@ -69,11 +69,11 @@ function propertiesOf(schema: OntologySchema, type: string): Set<string> {
   return new Set(schema.objectTypes.find(t => t.apiName === type)?.properties.map(p => p.apiName))
 }
 
-function compile(filter: Filter, props: Set<string>): (o: ObjectRecord) => boolean {
+export function compileFilter(filter: Filter, props: Set<string>): (o: ObjectRecord) => boolean {
   if (!filter || typeof filter !== 'object') throw new Error('Filter must be an object.')
-  if ('and' in filter) { const parts = filter.and.map(f => compile(f, props)); return o => parts.every(p => p(o)) }
-  if ('or' in filter) { const parts = filter.or.map(f => compile(f, props)); return o => parts.some(p => p(o)) }
-  if ('not' in filter) { const inner = compile(filter.not, props); return o => !inner(o) }
+  if ('and' in filter) { const parts = filter.and.map(f => compileFilter(f, props)); return o => parts.every(p => p(o)) }
+  if ('or' in filter) { const parts = filter.or.map(f => compileFilter(f, props)); return o => parts.some(p => p(o)) }
+  if ('not' in filter) { const inner = compileFilter(filter.not, props); return o => !inner(o) }
   const { property, op, value } = filter
   if (!props.has(property)) throw new Error(`Unknown property "${property}".`)
   if (!OPS.includes(op)) throw new Error(`Unknown operator "${op}".`)

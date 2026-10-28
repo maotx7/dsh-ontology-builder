@@ -30,6 +30,13 @@ test('fabricated or empty quotes are rejected', () => {
   assert.equal(findQuote(text, 'x'.repeat(3000)), undefined)
 })
 
+test('near prefers a later occurrence and falls back to the first', () => {
+  const t = 'Acme here.\nAcme  there.'
+  assert.equal(findQuote(t, 'Acme', 5).line, 2)
+  assert.equal(findQuote(t, 'Acme there', 5).mode, 'whitespace')
+  assert.equal(findQuote(t, 'here', 20).line, 1)
+})
+
 test('searchLines returns numbered matches', () => {
   assert.deepEqual(searchLines(text, 'ada', 5), [{ line: 2, text: 'Ada Lovelace worked   at' }])
 })

@@ -4,9 +4,9 @@
 
 从结构化数据、文档和源码构建可信的本体：一个参照 Palantir 本体理念的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件。
 
-> 状态：0.1（M1）。手动构建闭环已可用：schema 起草与检查、发布、材料、带证据的候选、经审批的审核、查询和 RDF 导出。基于模型的自动抽取在 0.2 提供。详见[设计文档](docs/DESIGN.md)。
+> 状态：0.2（M2）。可以用 DSH 中已配置的模型抽取文档；重复实体、取值冲突和经批准的确认规则都有完整审计。代码分析和可视化界面在 0.3/0.4 提供。详见[设计文档](docs/DESIGN.md)。
 
-## 工具（0.1）
+## 工具
 
 | 工具 | 作用 |
 |---|---|
@@ -14,14 +14,18 @@
 | `ontology_schema` | 读取、起草（附检查结果）、对比 schema |
 | `ontology_schema_publish` | 发布不可变的 schema 版本，需用户审批 |
 | `ontology_material_add` / `ontology_material_read` | 存入只读原文（SHA-256），按行读取以便引用 |
-| `ontology_assert` | 按批次记录候选对象和链接，每条都要有逐字可查的引文 |
+| `ontology_extract` | 用 DSH 的模型从材料中抽取候选；引文逐字核验，不合格的退回模型修正 |
+| `ontology_assert` | 手动按批次记录候选对象和链接，每条都要有逐字可查的引文 |
 | `ontology_review_preview` / `ontology_review_commit` | 查看候选及证据；确认或驳回，需用户审批 |
 | `ontology_batch_rollback` | 整批撤销一次抽取 |
+| `ontology_resolve` | 提示可能重复的实体、合并（需审批，旧主键保留为别名）、标记为不同实体 |
+| `ontology_conflict` | 查看并裁决不同来源的取值冲突（需审批） |
+| `ontology_rule` | 预览、批准、执行确认规则；抽样复核；准确率过低时规则自动停用 |
 | `ontology_query` | ObjectSet 查询：过滤、沿链接遍历、聚合 |
 | `ontology_export` | 导出 Turtle（OWL + SHACL + PROV）或 JSON-LD |
 | `ontology_audit` | 只追加的审计日志 |
 
-确认和发布都走 DSH 的审批服务。没有人能应答时（无头运行，或会话审批策略为 `never`），变更会被拒绝。
+发布、确认、驳回、合并、裁决冲突、批准规则都走 DSH 的审批服务。没有人能应答时（无头运行，或会话审批策略为 `never`），变更会被拒绝。规则只能确认通过全部常规检查的候选，不接受 inferred 证据，并且总会抽样复核。
 
 ## 规划能力
 
@@ -43,6 +47,13 @@ dsh plugin --profile <name> add dsh-ontology-builder
 | 键 | 默认值 | 含义 |
 |---|---|---|
 | `databasePath` | `ontology-builder.db` | 本体项目使用的 SQLite 数据库文件 |
+| `extraction.chunkChars` | `4000` | 每块发给模型的字符数 |
+| `extraction.overlapChars` | `300` | 相邻块的重叠字符数 |
+| `extraction.maxAttempts` | `3` | 每块的模型尝试次数（含修正） |
+| `extraction.maxChunks` | `20` | 每次 `ontology_extract` 处理的块数，其余返回供续跑 |
+| `extraction.maxTokens` | `8192` | 每次模型调用的输出 token 上限 |
+
+材料文本只会发送给 DSH 配置中的模型。
 
 ## 许可证
 

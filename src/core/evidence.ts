@@ -16,16 +16,20 @@ export const MAX_QUOTE_LENGTH = 2000
  * Find `quote` in `text`. Tries an exact match first, then tolerates collapsed
  * whitespace, then ignores whitespace entirely (line breaks inside CJK text
  * extracted from PDF/DOCX). Never matches on anything looser than that.
+ * With `near`, an occurrence at or after that offset is preferred, so a quote
+ * extracted from one chunk resolves to that chunk rather than an earlier repeat.
  */
-export function findQuote(text: string, quote: string): QuoteMatch | undefined {
+export function findQuote(text: string, quote: string, near = 0): QuoteMatch | undefined {
   const needle = quote.trim()
   if (!needle || needle.length > MAX_QUOTE_LENGTH) return undefined
-  const exact = text.indexOf(needle)
+  const after = (at: number) => (at >= 0 ? at : undefined)
+  const exact = after(text.indexOf(needle, near)) ?? text.indexOf(needle)
   if (exact >= 0) return { start: exact, end: exact + needle.length, line: lineAt(text, exact), mode: 'exact' }
   for (const mode of ['whitespace', 'compact'] as const) {
     const haystack = normalize(text, mode)
     const target = normalize(needle, mode).text
-    const at = target ? haystack.text.indexOf(target) : -1
+    const from = haystack.map.findIndex(i => i >= near)
+    const at = !target ? -1 : (from >= 0 ? after(haystack.text.indexOf(target, from)) : undefined) ?? haystack.text.indexOf(target)
     if (at >= 0) {
       const start = haystack.map[at]
       const end = haystack.map[at + target.length - 1] + 1
