@@ -1,29 +1,121 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import * as plugin from '../dist/index.js'
 
-function fakeContext() {
-  const registered = []
+function fakeContext(answer = 'allowed-once') {
+  const registered = new Map()
   const disposers = []
+  const asked = []
   return {
     registered,
-    disposers,
-    tools: { register(definition) { registered.push(definition); return () => {} } },
+    asked,
+    dispose: () => disposers.reverse().forEach(d => d?.()),
+    tools: { register(definition) { registered.set(definition.name, definition); return () => registered.delete(definition.name) } },
+    approval: { async request(req) { asked.push(req); return typeof answer === 'function' ? answer(req) : answer } },
     effect(fn) { disposers.push(fn()) }
   }
 }
 
+function withWorkspace(fn) {
+  return async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'obtest-'))
+    const cwd = process.cwd()
+    process.chdir(dir)
+    try { await fn(dir) } finally { process.chdir(cwd); rmSync(dir, { recursive: true, force: true }) }
+  }
+}
+
+const exec = { agent: { id: 'a' }, callId: 'call_1' }
+const SCHEMA = {
+  questions: [{ id: 'q1', text: 'Which team owns a service?', priority: 'must' }],
+  objectTypes: [
+    { apiName: 'Team', primaryKey: 'name', questions: ['q1'], properties: [{ apiName: 'name', type: 'string' }, { apiName: 'lead', type: 'string' }] },
+    { apiName: 'Service', primaryKey: 'name', questions: ['q1'], properties: [{ apiName: 'name', type: 'string' }, { apiName: 'tier', type: 'integer' }] }
+  ],
+  linkTypes: [{ apiName: 'owner', inverseApiName: 'services', from: 'Service', to: 'Team', cardinality: 'many-to-one', questions: ['q1'] }]
+}
+
 test('exports a Cordis plugin shape', () => {
   assert.equal(plugin.name, 'ontology-builder')
-  assert.deepEqual(plugin.inject, ['tools'])
+  assert.deepEqual(plugin.inject, ['tools', 'approval'])
   assert.equal(typeof plugin.apply, 'function')
   assert.equal(plugin.Config({}).databasePath, 'ontology-builder.db')
 })
 
-test('registers ontology_status and reports configuration', async () => {
+test('end-to-end build through the tools', withWorkspace(async dir => {
   const ctx = fakeContext()
-  plugin.apply(ctx, { databasePath: '/tmp/x.db' })
-  assert.deepEqual(ctx.registered.map(tool => tool.name), ['ontology_status'])
-  const value = await ctx.registered[0].execute({})
-  assert.deepEqual(value, { plugin: 'ontology-builder', version: '0.0.1', databasePath: '/tmp/x.db' })
-})
+  plugin.apply(ctx, { databasePath: 'state/onto.db' })
+  const call = (name, args, e = exec) => ctx.registered.get(name).execute(args, e)
+  for (const tool of ctx.registered.values()) assert.equal(tool.parameters.type, 'object', tool.name)
+
+  await call('ontology_project', { action: 'create', name: 'platform' })
+  const drafted = await call('ontology_schema', { action: 'draft', project: 'platform', schema: SCHEMA })
+  assert.deepEqual(drafted.issues.filter(i => i.severity !== 'hint'), [])
+  const pub = await call('ontology_schema_publish', { project: 'platform' })
+  assert.equal(pub.version, 1)
+  assert.match(ctx.asked[0].reason, /Publish schema v1.*object types \+2/)
+  assert.equal(ctx.asked[0].callId, 'call_1')
+
+  writeFileSync(join(dir, 'owners.md'), '# Owners\nThe billing service (tier 1) is owned by the Payments team.\nPayments is led by Kim.\n')
+  const mat = (await call('ontology_material_add', { project: 'platform', path: 'owners.md' })).material
+  assert.equal(mat.lines, 4)
+  await assert.rejects(call('ontology_material_add', { project: 'platform', path: '../outside.txt' }), /inside the workspace/)
+  const found = await call('ontology_material_read', { project: 'platform', materialId: mat.id, query: 'payments' })
+  assert.equal(found.matches.length, 2)
+
+  const e = quote => [{ materialId: mat.id, quote }]
+  const batch = await call('ontology_assert', { project: 'platform', extractor: 'test', objects: [
+    { type: 'Service', properties: { name: 'billing', tier: 1 }, evidence: e('billing service (tier 1)') },
+    { type: 'Team', properties: { name: 'Payments', lead: 'Kim' }, evidence: e('Payments is led by Kim') },
+    { type: 'Team', properties: { name: 'Ghost' }, evidence: e('Ghost team') }
+  ], links: [{ linkType: 'owner', from: { type: 'Service', key: 'billing' }, to: { type: 'Team', key: 'Payments' }, evidence: e('owned by the Payments team') }] })
+  assert.equal(batch.failed, 1)
+
+  const preview = await call('ontology_review_preview', { project: 'platform' })
+  assert.equal(preview.total, 3)
+  assert.ok(preview.items.every(i => i.ready && i.evidence.length === 1))
+
+  const ids = preview.items.map(i => i.id)
+  const done = await call('ontology_review_commit', { project: 'platform', decision: 'confirm', ids })
+  assert.equal(done.confirmed.length, 3)
+  assert.match(ctx.asked[1].reason, /Confirm 3 candidate\(s\).*Service "billing"/)
+
+  const owners = await call('ontology_query', { project: 'platform', objectType: 'Team', where: { property: 'lead', op: 'eq', value: 'Kim' }, traverse: [{ link: 'services' }] })
+  assert.deepEqual(owners.objects.map(o => o.key), ['billing'])
+
+  const out = await call('ontology_export', { project: 'platform', format: 'turtle', path: 'out/platform.ttl', base: 'https://example.org/p/' })
+  assert.equal(out.objects, 2)
+  assert.match(readFileSync(join(dir, 'out/platform.ttl'), 'utf8'), /<https:\/\/example.org\/p\/Service\/billing> :owner <https:\/\/example.org\/p\/Team\/Payments>/)
+
+  const audit = await call('ontology_audit', { project: 'platform' })
+  assert.deepEqual(audit.entries.map(a => a.action).slice(0, 3), ['review.confirm', 'batch.assert', 'material.add'])
+  ctx.dispose()
+}))
+
+test('changes stop when the user does not approve', withWorkspace(async () => {
+  const ctx = fakeContext('rejected')
+  plugin.apply(ctx, { databasePath: 'onto.db' })
+  const call = (name, args, e = exec) => ctx.registered.get(name).execute(args, e)
+  await call('ontology_project', { action: 'create', name: 'p' })
+  await call('ontology_schema', { action: 'draft', project: 'p', schema: SCHEMA })
+  await assert.rejects(call('ontology_schema_publish', { project: 'p' }), /Not approved \(rejected\)/)
+  await assert.rejects(call('ontology_schema_publish', { project: 'p' }, {}), /no agent/)
+  assert.equal((await call('ontology_project', { action: 'get', project: 'p' })).published, null)
+  ctx.dispose()
+}))
+
+test('publishing reports blocking issues without asking', withWorkspace(async () => {
+  const ctx = fakeContext()
+  plugin.apply(ctx, { databasePath: 'onto.db' })
+  const call = (name, args) => ctx.registered.get(name).execute(args, exec)
+  await call('ontology_project', { action: 'create', name: 'p' })
+  await call('ontology_schema', { action: 'draft', project: 'p', schema: { objectTypes: [{ apiName: 'A', primaryKey: 'x', properties: [] }] } })
+  const result = await call('ontology_schema_publish', { project: 'p' })
+  assert.equal(result.published, false)
+  assert.ok(result.blocking.some(i => i.code === 'MISSING_PRIMARY_KEY'))
+  assert.equal(ctx.asked.length, 0)
+  ctx.dispose()
+}))

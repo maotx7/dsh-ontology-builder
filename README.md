@@ -4,7 +4,24 @@ English | [中文](README.zh.md)
 
 Build trustworthy ontologies from data, documents and code — a Palantir-style ontology builder plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 
-> Status: early development (M0). The plugin loads in DSH and exposes `ontology_status`; building features land in 0.1+. See the [design document](docs/DESIGN.md) (Chinese).
+> Status: 0.1 (M1). Manual build loop works end to end: schema drafting and checks, publishing, materials, evidence-backed candidates, approval-gated review, queries and RDF export. LLM-driven extraction lands in 0.2. See the [design document](docs/DESIGN.md) (Chinese).
+
+## Tools (0.1)
+
+| Tool | Purpose |
+|---|---|
+| `ontology_project` | Create, list or inspect projects |
+| `ontology_schema` | Read, draft (with checks) or diff the schema |
+| `ontology_schema_publish` | Publish an immutable schema version — asks for approval |
+| `ontology_material_add` / `ontology_material_read` | Store read-only source text (SHA-256), read lines to quote from |
+| `ontology_assert` | Record candidate objects/links in a batch; every item needs a verbatim quote |
+| `ontology_review_preview` / `ontology_review_commit` | Show candidates with evidence; confirm or reject — asks for approval |
+| `ontology_batch_rollback` | Undo one extraction batch |
+| `ontology_query` | ObjectSet query: filter, traverse links, aggregate |
+| `ontology_export` | Turtle (OWL + SHACL + PROV) or JSON-LD |
+| `ontology_audit` | Append-only audit log |
+
+Confirmation and publishing go through DSH's approval service. If no one can answer (headless runs, or the session's approval policy is `never`), the change is refused.
 
 ## What it will do
 

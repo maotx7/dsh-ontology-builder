@@ -403,7 +403,6 @@ export class Store {
         for (const link of this.all("SELECT id FROM links WHERE project_id = ? AND status = 'candidate' AND (from_id = ? OR to_id = ?)", projectId, id, id)) {
           if (!rejected.includes(String(link.id))) rejected.push(String(link.id))
         }
-        if (this.get("SELECT 1 FROM links WHERE project_id = ? AND status = 'confirmed' AND (from_id = ? OR to_id = ?)", projectId, id, id)) throw new Error(`Object ${id} has confirmed links; reject those links first.`)
       }
       this.setStatus(projectId, rejected, 'rejected', { ...auth, note })
       this.audit(projectId, 'review.reject', { ids: rejected, skipped, note, authorization: auth })
