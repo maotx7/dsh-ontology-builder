@@ -64,7 +64,7 @@
     "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && vite build --config client/vite.config.ts",
+    "build": "tsc -p tsconfig.json && node scripts/build-client.mjs && vite build --config client/vite.config.ts",
     "prepublishOnly": "npm run build",
     "build:server": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p client/tsconfig.json",
