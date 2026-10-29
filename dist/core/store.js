@@ -1,0 +1,1062 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
+import { findQuote, lineAt } from './evidence.js';
+import { compileFilter, runQuery } from './query.js';
+import { normalizeKey, suggestDuplicates } from './resolve.js';
+import { emptySchema, normalizeSchema, validateProperties, validateSchema } from './schema.js';
+export const EVIDENCE_ROLES = ['specified', 'observed', 'correspondence', 'inferred'];
+const DDL = `
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT NOT NULL, draft TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS schema_versions (project_id TEXT NOT NULL REFERENCES projects(id), version INTEGER NOT NULL, schema TEXT NOT NULL, hash TEXT NOT NULL, note TEXT NOT NULL, authorization TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (project_id, version));
+CREATE TABLE IF NOT EXISTS materials (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), name TEXT NOT NULL, sha256 TEXT NOT NULL, text TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE (project_id, sha256));
+CREATE TABLE IF NOT EXISTS batches (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), extractor TEXT NOT NULL, schema_version INTEGER NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS objects (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), type TEXT NOT NULL, key TEXT NOT NULL, properties TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('candidate', 'confirmed', 'rejected')), batch_id TEXT NOT NULL REFERENCES batches(id), decision TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (project_id, type, key));
+CREATE TABLE IF NOT EXISTS links (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), link_type TEXT NOT NULL, from_id TEXT NOT NULL REFERENCES objects(id), to_id TEXT NOT NULL REFERENCES objects(id),
+  status TEXT NOT NULL CHECK (status IN ('candidate', 'confirmed', 'rejected')), batch_id TEXT NOT NULL REFERENCES batches(id), decision TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (project_id, link_type, from_id, to_id));
+CREATE TABLE IF NOT EXISTS evidence (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), target_id TEXT NOT NULL, field TEXT, material_id TEXT NOT NULL REFERENCES materials(id),
+  start_offset INTEGER NOT NULL, end_offset INTEGER NOT NULL, line INTEGER NOT NULL, quote TEXT NOT NULL, match TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('specified', 'observed', 'correspondence', 'inferred')), batch_id TEXT NOT NULL REFERENCES batches(id), created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS evidence_target ON evidence (target_id);
+CREATE TABLE IF NOT EXISTS merges (batch_id TEXT NOT NULL REFERENCES batches(id), object_id TEXT NOT NULL REFERENCES objects(id), before TEXT NOT NULL, PRIMARY KEY (batch_id, object_id));
+CREATE TABLE IF NOT EXISTS aliases (project_id TEXT NOT NULL, type TEXT NOT NULL, norm_key TEXT NOT NULL, object_id TEXT NOT NULL REFERENCES objects(id),
+  origin TEXT NOT NULL CHECK (origin IN ('key', 'merge')), created_at TEXT NOT NULL, PRIMARY KEY (project_id, type, norm_key));
+CREATE TABLE IF NOT EXISTS entity_merges (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, keep_id TEXT NOT NULL, drop_id TEXT NOT NULL, drop_key TEXT NOT NULL, batches TEXT NOT NULL, before TEXT NOT NULL, authorization TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS distinct_pairs (project_id TEXT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (project_id, a, b));
+CREATE TABLE IF NOT EXISTS conflicts (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, target_id TEXT NOT NULL, field TEXT NOT NULL, kept TEXT NOT NULL, other TEXT NOT NULL, batch_id TEXT REFERENCES batches(id), resolution TEXT, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS conflicts_target ON conflicts (target_id);
+CREATE TABLE IF NOT EXISTS extraction_runs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, batch_id TEXT NOT NULL REFERENCES batches(id), material_id TEXT NOT NULL REFERENCES materials(id),
+  chunk_start INTEGER NOT NULL, chunk_end INTEGER NOT NULL, chunk_sha256 TEXT NOT NULL, prompt_version TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+  attempts INTEGER NOT NULL, output TEXT NOT NULL, problems TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rules (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), definition TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
+  authorization TEXT NOT NULL, disabled_reason TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rule_samples (rule_id TEXT NOT NULL REFERENCES rules(id), target_id TEXT NOT NULL, verdict TEXT CHECK (verdict IN ('correct', 'wrong')), note TEXT,
+  created_at TEXT NOT NULL, judged_at TEXT, PRIMARY KEY (rule_id, target_id));
+CREATE TABLE IF NOT EXISTS code_snapshots (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), root TEXT NOT NULL, files INTEGER NOT NULL, stats TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS code_modules (snapshot_id TEXT NOT NULL REFERENCES code_snapshots(id), path TEXT NOT NULL, language TEXT NOT NULL, material_id TEXT NOT NULL REFERENCES materials(id), lines INTEGER NOT NULL, PRIMARY KEY (snapshot_id, path));
+CREATE TABLE IF NOT EXISTS code_symbols (snapshot_id TEXT NOT NULL REFERENCES code_snapshots(id), qualified_name TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, module TEXT NOT NULL, container TEXT,
+  start_offset INTEGER NOT NULL, end_offset INTEGER NOT NULL, line INTEGER NOT NULL, PRIMARY KEY (snapshot_id, qualified_name));
+CREATE INDEX IF NOT EXISTS code_symbols_name ON code_symbols (snapshot_id, name);
+CREATE TABLE IF NOT EXISTS code_edges (snapshot_id TEXT NOT NULL REFERENCES code_snapshots(id), kind TEXT NOT NULL CHECK (kind IN ('imports', 'calls')), source TEXT NOT NULL, target TEXT NOT NULL,
+  start_offset INTEGER NOT NULL, end_offset INTEGER NOT NULL, line INTEGER NOT NULL, PRIMARY KEY (snapshot_id, kind, source, target));
+CREATE TABLE IF NOT EXISTS code_links (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), object_id TEXT NOT NULL REFERENCES objects(id), code_ref TEXT NOT NULL, relation TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('candidate', 'confirmed', 'rejected')), batch_id TEXT NOT NULL REFERENCES batches(id), decision TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (project_id, object_id, code_ref, relation));
+CREATE TABLE IF NOT EXISTS question_queries (project_id TEXT NOT NULL REFERENCES projects(id), question_id TEXT NOT NULL, query TEXT NOT NULL, expect TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (project_id, question_id));
+CREATE TABLE IF NOT EXISTS question_runs (seq INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, question_id TEXT NOT NULL, schema_version INTEGER, result TEXT NOT NULL, passed INTEGER NOT NULL, at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, at TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL);
+CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON audit BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS versions_no_update BEFORE UPDATE ON schema_versions BEGIN SELECT RAISE(ABORT, 'published schema versions are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS versions_no_delete BEFORE DELETE ON schema_versions BEGIN SELECT RAISE(ABORT, 'published schema versions are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS materials_no_update BEFORE UPDATE ON materials BEGIN SELECT RAISE(ABORT, 'materials are read-only'); END;
+`;
+const now = () => new Date().toISOString();
+const newId = (prefix) => `${prefix}_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+export const sha256 = (text) => createHash('sha256').update(text).digest('hex');
+const issue = (code, path, message, severity = 'blocking') => ({ severity, code, path, message });
+/** JSON with sorted object keys, so equal schemas hash equally. */
+export function canonicalJson(value) {
+    return JSON.stringify(value, (_key, v) => (v && typeof v === 'object' && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : v));
+}
+/** Stable pseudo-random value in [0, 1) per rule and record, so sampling is reproducible. */
+const sampleScore = (ruleId, id) => parseInt(createHash('sha256').update(`${ruleId}:${id}`).digest('hex').slice(0, 8), 16) / 0x100000000;
+const tableOf = (id) => (id.startsWith('obj_') ? 'objects' : id.startsWith('cln_') ? 'code_links' : 'links');
+const parseJson = (value) => JSON.parse(String(value));
+function assertAuthorized(auth) {
+    if (auth?.kind !== 'approval' || auth.outcome !== 'allowed-once' || typeof auth.reason !== 'string')
+        throw new Error('A user approval record is required for this change.');
+}
+export class Store {
+    db;
+    constructor(path) {
+        this.db = new DatabaseSync(path);
+        this.db.exec(DDL);
+        // Databases created before aliases existed: give every object its key alias.
+        for (const row of this.all("SELECT id, project_id, type, key FROM objects o WHERE NOT EXISTS (SELECT 1 FROM aliases a WHERE a.object_id = o.id)")) {
+            this.run("INSERT OR IGNORE INTO aliases (project_id, type, norm_key, object_id, origin, created_at) VALUES (?, ?, ?, ?, 'key', ?)", String(row.project_id), String(row.type), normalizeKey(String(row.key)), String(row.id), now());
+        }
+    }
+    close() { this.db.close(); }
+    tx(fn) {
+        this.db.exec('BEGIN IMMEDIATE');
+        try {
+            const result = fn();
+            this.db.exec('COMMIT');
+            return result;
+        }
+        catch (error) {
+            this.db.exec('ROLLBACK');
+            throw error;
+        }
+    }
+    get(sql, ...params) { return this.db.prepare(sql).get(...params); }
+    all(sql, ...params) { return this.db.prepare(sql).all(...params); }
+    run(sql, ...params) { this.db.prepare(sql).run(...params); }
+    audit(projectId, action, detail) {
+        this.run('INSERT INTO audit (project_id, at, action, detail) VALUES (?, ?, ?, ?)', projectId, now(), action, JSON.stringify(detail));
+    }
+    createProject(name, description = '') {
+        if (!name.trim())
+            throw new Error('Project name is required.');
+        if (this.get('SELECT 1 FROM projects WHERE name = ?', name))
+            throw new Error(`Project "${name}" already exists.`);
+        const project = { id: newId('prj'), name, description, createdAt: now() };
+        this.tx(() => {
+            this.run('INSERT INTO projects (id, name, description, draft, created_at) VALUES (?, ?, ?, ?, ?)', project.id, name, description, JSON.stringify(emptySchema()), project.createdAt);
+            this.audit(project.id, 'project.create', { name });
+        });
+        return project;
+    }
+    listProjects() {
+        return this.all('SELECT id, name, description, created_at FROM projects ORDER BY created_at').map(toProject);
+    }
+    /** Resolve a project by id or name. */
+    project(idOrName) {
+        const row = this.get('SELECT id, name, description, created_at FROM projects WHERE id = ? OR name = ?', idOrName, idOrName);
+        if (!row)
+            throw new Error(`Unknown project "${idOrName}".`);
+        return toProject(row);
+    }
+    draft(projectId) {
+        return JSON.parse(String(this.get('SELECT draft FROM projects WHERE id = ?', projectId)?.draft));
+    }
+    /** Replace the working draft. Drafts may contain issues; publishing may not. */
+    setDraft(projectId, input) {
+        const schema = normalizeSchema(input);
+        this.tx(() => {
+            this.run('UPDATE projects SET draft = ? WHERE id = ?', JSON.stringify(schema), projectId);
+            this.audit(projectId, 'schema.draft', { hash: sha256(canonicalJson(schema)) });
+        });
+        return { schema, issues: validateSchema(schema) };
+    }
+    published(projectId) {
+        const row = this.get('SELECT version, schema, hash, note, created_at FROM schema_versions WHERE project_id = ? ORDER BY version DESC LIMIT 1', projectId);
+        return row && { version: Number(row.version), schema: JSON.parse(String(row.schema)), hash: String(row.hash), note: String(row.note), createdAt: String(row.created_at) };
+    }
+    /** Checks that decide whether the draft may be published; empty `blocking` means it may. */
+    publishCheck(projectId, note = '') {
+        const schema = this.draft(projectId);
+        const issues = validateSchema(schema);
+        const hash = sha256(canonicalJson(schema));
+        const blocking = issues.filter(i => i.severity === 'blocking');
+        const warnings = issues.filter(i => i.severity === 'warning');
+        if (!schema.objectTypes.length)
+            blocking.push(issue('EMPTY_SCHEMA', 'objectTypes', 'Define at least one object type before publishing.'));
+        if (warnings.length && !note.trim())
+            blocking.push(issue('NOTE_REQUIRED', 'note', 'The draft has warnings; publishing needs a note explaining why they are accepted.'));
+        return { blocking, warnings, hash, unchanged: this.published(projectId)?.hash === hash };
+    }
+    publish(projectId, note, auth) {
+        assertAuthorized(auth);
+        return this.tx(() => {
+            const check = this.publishCheck(projectId, note);
+            if (check.blocking.length)
+                throw new Error(`Draft cannot be published: ${check.blocking.map(i => i.message).join(' ')}`);
+            if (check.unchanged)
+                throw new Error('Draft is identical to the latest published version.');
+            const version = (this.published(projectId)?.version ?? 0) + 1;
+            this.run('INSERT INTO schema_versions (project_id, version, schema, hash, note, authorization, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)', projectId, version, JSON.stringify(this.draft(projectId)), check.hash, note, JSON.stringify(auth), now());
+            this.audit(projectId, 'schema.publish', { version, hash: check.hash, note, authorization: auth });
+            return this.published(projectId);
+        });
+    }
+    /** Store source text. Identical content is stored once and keeps its first id. */
+    addMaterial(projectId, name, text) {
+        const hash = sha256(text);
+        const existing = this.get('SELECT id FROM materials WHERE project_id = ? AND sha256 = ?', projectId, hash);
+        if (existing)
+            return { material: this.material(projectId, String(existing.id)), created: false };
+        const id = newId('mat');
+        this.tx(() => {
+            this.run('INSERT INTO materials (id, project_id, name, sha256, text, created_at) VALUES (?, ?, ?, ?, ?, ?)', id, projectId, name, hash, text, now());
+            this.audit(projectId, 'material.add', { id, name, sha256: hash, length: text.length });
+        });
+        return { material: this.material(projectId, id), created: true };
+    }
+    material(projectId, id) {
+        const row = this.get('SELECT id, name, sha256, text, created_at FROM materials WHERE project_id = ? AND id = ?', projectId, id);
+        if (!row)
+            throw new Error(`Unknown material "${id}".`);
+        return { id: String(row.id), name: String(row.name), sha256: String(row.sha256), text: String(row.text), createdAt: String(row.created_at) };
+    }
+    listMaterials(projectId) {
+        return this.all('SELECT id, name, sha256, length(text) AS length, created_at FROM materials WHERE project_id = ? ORDER BY created_at', projectId)
+            .map(r => ({ id: String(r.id), name: String(r.name), sha256: String(r.sha256), length: Number(r.length), createdAt: String(r.created_at) }));
+    }
+    /**
+     * Record extracted objects and links as candidates in one batch, checked
+     * against the latest published schema. Every item needs at least one quote
+     * that is found verbatim in a stored material; items failing any check are
+     * reported and not stored. Nothing here can produce a confirmed record.
+     */
+    assertCandidates(projectId, extractor, input, runs = []) {
+        const published = this.published(projectId);
+        if (!published)
+            throw new Error('Publish a schema version before recording instances.');
+        const types = new Map(published.schema.objectTypes.map(t => [t.apiName, t]));
+        const linkTypes = new Map(published.schema.linkTypes.map(l => [l.apiName, l]));
+        const batchId = newId('bat');
+        const at = now();
+        return this.tx(() => {
+            this.run('INSERT INTO batches (id, project_id, extractor, schema_version, created_at) VALUES (?, ?, ?, ?, ?)', batchId, projectId, extractor, published.version, at);
+            const objects = (input.objects ?? []).map((item, index) => this.assertObject(projectId, batchId, types, item, index, at));
+            const links = (input.links ?? []).map((item, index) => this.assertLink(projectId, batchId, linkTypes, item, index, at));
+            for (const r of runs) {
+                this.run('INSERT INTO extraction_runs (id, project_id, batch_id, material_id, chunk_start, chunk_end, chunk_sha256, prompt_version, provider, model, attempts, output, problems, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', newId('run'), projectId, batchId, r.materialId, r.chunkStart, r.chunkEnd, r.chunkSha256, r.promptVersion, r.provider, r.model, r.attempts, JSON.stringify(r.output), JSON.stringify(r.problems), at);
+            }
+            this.audit(projectId, 'batch.assert', { batchId, extractor, schemaVersion: published.version, objects: tally(objects), links: tally(links) });
+            return { batchId, schemaVersion: published.version, objects, links };
+        });
+    }
+    assertObject(projectId, batchId, types, item, index, at) {
+        const type = types.get(item?.type);
+        if (!type)
+            return { index, outcome: 'failed', issues: [issue('UNKNOWN_TYPE', 'type', `"${item?.type}" is not an object type in the published schema.`)] };
+        const properties = item.properties && typeof item.properties === 'object' ? item.properties : {};
+        const issues = validateProperties(type, properties);
+        const fields = new Set(type.properties.map(p => p.apiName));
+        const evidence = this.checkEvidence(projectId, item.evidence, field => field === undefined || fields.has(field), issues);
+        if (issues.some(i => i.severity === 'blocking'))
+            return { index, outcome: 'failed', issues };
+        const key = String(properties[type.primaryKey]);
+        const existing = this.findObject(projectId, type.apiName, key);
+        let id;
+        if (existing) {
+            id = String(existing.id);
+            if (existing.status === 'rejected')
+                return { index, outcome: 'failed', id, issues: [issue('PREVIOUSLY_REJECTED', 'properties', `${type.apiName} "${key}" was rejected before.`)] };
+            if (existing.key !== key)
+                issues.push(issue('MATCHED_EXISTING', type.primaryKey, `Matched existing ${type.apiName} "${existing.key}".`, 'hint'));
+            const merged = JSON.parse(String(existing.properties));
+            for (const [field, value] of Object.entries(properties)) {
+                if (value === null || value === undefined || field === type.primaryKey)
+                    continue;
+                if (merged[field] === undefined || merged[field] === null)
+                    merged[field] = value;
+                else if (canonicalJson(merged[field]) !== canonicalJson(value)) {
+                    issues.push(issue('CONFLICTING_VALUE', field, `Kept existing value ${JSON.stringify(merged[field])}; this batch says ${JSON.stringify(value)}.`, 'warning'));
+                    this.addConflict(projectId, id, field, merged[field], value, batchId, at);
+                }
+            }
+            if (existing.status === 'confirmed' && canonicalJson(merged) !== canonicalJson(JSON.parse(String(existing.properties)))) {
+                issues.push(issue('CONFIRMED_UNCHANGED', 'properties', 'Object is confirmed; new values were not applied.', 'warning'));
+            }
+            else {
+                this.run('INSERT OR IGNORE INTO merges (batch_id, object_id, before) VALUES (?, ?, ?)', batchId, id, String(existing.properties));
+                this.run('UPDATE objects SET properties = ?, updated_at = ? WHERE id = ?', JSON.stringify(merged), at, id);
+            }
+        }
+        else {
+            id = newId('obj');
+            this.run('INSERT INTO objects (id, project_id, type, key, properties, status, batch_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', id, projectId, type.apiName, key, JSON.stringify(properties), 'candidate', batchId, at, at);
+            this.run("INSERT OR IGNORE INTO aliases (project_id, type, norm_key, object_id, origin, created_at) VALUES (?, ?, ?, ?, 'key', ?)", projectId, type.apiName, normalizeKey(key), id, at);
+        }
+        this.insertEvidence(projectId, batchId, id, evidence, at);
+        return { index, outcome: existing ? 'merged' : 'created', id, issues };
+    }
+    assertLink(projectId, batchId, linkTypes, item, index, at) {
+        const def = linkTypes.get(item?.linkType);
+        if (!def)
+            return { index, outcome: 'failed', issues: [issue('UNKNOWN_LINK_TYPE', 'linkType', `"${item?.linkType}" is not a link type in the published schema.`)] };
+        const issues = [];
+        const resolve = (ref, expected, side) => {
+            if (ref?.type !== expected) {
+                issues.push(issue('WRONG_ENDPOINT_TYPE', side, `${def.apiName}.${side} must be a ${expected}.`));
+                return;
+            }
+            const row = this.findObject(projectId, expected, String(ref.key));
+            if (!row)
+                issues.push(issue('UNKNOWN_ENDPOINT', side, `${expected} "${ref.key}" does not exist; record the object first.`));
+            else if (row.status === 'rejected')
+                issues.push(issue('REJECTED_ENDPOINT', side, `${expected} "${ref.key}" was rejected.`));
+            else
+                return String(row.id);
+        };
+        const fromId = resolve(item.from, def.from, 'from');
+        const toId = resolve(item.to, def.to, 'to');
+        const evidence = this.checkEvidence(projectId, item.evidence, field => field === undefined, issues);
+        if (!fromId || !toId || issues.some(i => i.severity === 'blocking'))
+            return { index, outcome: 'failed', issues };
+        const existing = this.get('SELECT id, status FROM links WHERE project_id = ? AND link_type = ? AND from_id = ? AND to_id = ?', projectId, def.apiName, fromId, toId);
+        if (existing?.status === 'rejected')
+            return { index, outcome: 'failed', id: String(existing.id), issues: [issue('PREVIOUSLY_REJECTED', 'link', 'This link was rejected before.')] };
+        const id = existing ? String(existing.id) : newId('lnk');
+        if (!existing) {
+            issues.push(...this.cardinalityIssues(projectId, def, fromId, toId, ['candidate', 'confirmed'], 'warning'));
+            this.run('INSERT INTO links (id, project_id, link_type, from_id, to_id, status, batch_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', id, projectId, def.apiName, fromId, toId, 'candidate', batchId, at, at);
+        }
+        this.insertEvidence(projectId, batchId, id, evidence, at);
+        return { index, outcome: existing ? 'merged' : 'created', id, issues };
+    }
+    /** Locate each quote in its material. Unlocatable quotes are blocking: the model may not cite text that is not there. */
+    checkEvidence(projectId, input, fieldAllowed, issues) {
+        const located = [];
+        const list = Array.isArray(input) ? input : [];
+        if (!list.length)
+            issues.push(issue('NO_EVIDENCE', 'evidence', 'At least one quote from a stored material is required.'));
+        list.forEach((ev, i) => {
+            const path = `evidence[${i}]`;
+            const role = ev?.role ?? 'specified';
+            if (!EVIDENCE_ROLES.includes(role))
+                return issues.push(issue('INVALID_ROLE', path, `role must be one of ${EVIDENCE_ROLES.join(', ')}.`));
+            if (!fieldAllowed(ev.field))
+                return issues.push(issue('UNKNOWN_FIELD', path, `field "${ev.field}" is not a property here.`));
+            const row = this.get('SELECT text FROM materials WHERE project_id = ? AND id = ?', projectId, String(ev.materialId));
+            if (!row)
+                return issues.push(issue('UNKNOWN_MATERIAL', path, `Material "${ev.materialId}" is not stored in this project.`));
+            const near = Number.isInteger(ev.near) && Number(ev.near) >= 0 ? Number(ev.near) : 0;
+            const match = typeof ev.quote === 'string' ? findQuote(String(row.text), ev.quote, near) : undefined;
+            if (!match)
+                return issues.push(issue('QUOTE_NOT_FOUND', path, `Quote not found verbatim in ${ev.materialId}; copy it exactly from the material.`));
+            const text = String(row.text);
+            located.push({ materialId: String(ev.materialId), field: ev.field ?? null, quote: text.slice(match.start, match.end), role, start: match.start, end: match.end, line: match.line, match: match.mode });
+        });
+        return located;
+    }
+    insertEvidence(projectId, batchId, targetId, evidence, at) {
+        for (const ev of evidence) {
+            this.run('INSERT INTO evidence (id, project_id, target_id, field, material_id, start_offset, end_offset, line, quote, match, role, batch_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', newId('evd'), projectId, targetId, ev.field, ev.materialId, ev.start, ev.end, ev.line, ev.quote, ev.match, ev.role, batchId, at);
+        }
+    }
+    /** Look an object up by exact key, then by normalized key or a recorded alias. */
+    findObject(projectId, type, key) {
+        return this.get('SELECT id, key, properties, status FROM objects WHERE project_id = ? AND type = ? AND key = ?', projectId, type, key)
+            ?? this.get('SELECT o.id, o.key, o.properties, o.status FROM aliases a JOIN objects o ON o.id = a.object_id WHERE a.project_id = ? AND a.type = ? AND a.norm_key = ?', projectId, type, normalizeKey(key));
+    }
+    addConflict(projectId, targetId, field, kept, other, batchId, at) {
+        const known = this.all('SELECT other FROM conflicts WHERE project_id = ? AND target_id = ? AND field = ? AND resolution IS NULL', projectId, targetId, field);
+        if (known.some(r => canonicalJson(parseJson(r.other)) === canonicalJson(other)))
+            return;
+        this.run('INSERT INTO conflicts (id, project_id, target_id, field, kept, other, batch_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', newId('cfl'), projectId, targetId, field, JSON.stringify(kept), JSON.stringify(other), batchId, at);
+    }
+    /** Open value conflicts, optionally for one record. */
+    conflicts(projectId, targetId) {
+        const rows = targetId
+            ? this.all('SELECT * FROM conflicts WHERE project_id = ? AND target_id = ? AND resolution IS NULL ORDER BY rowid', projectId, targetId)
+            : this.all('SELECT * FROM conflicts WHERE project_id = ? AND resolution IS NULL ORDER BY rowid', projectId);
+        return rows.map(r => ({ id: String(r.id), targetId: String(r.target_id), field: String(r.field), kept: parseJson(r.kept), other: parseJson(r.other), batchId: r.batch_id === null ? null : String(r.batch_id) }));
+    }
+    /** Settle one conflict by keeping the current value or taking the other. */
+    resolveConflict(projectId, conflictId, choice, auth) {
+        assertAuthorized(auth);
+        return this.tx(() => {
+            const row = this.get('SELECT * FROM conflicts WHERE project_id = ? AND id = ? AND resolution IS NULL', projectId, conflictId);
+            if (!row)
+                throw new Error(`No open conflict "${conflictId}".`);
+            const target = this.get('SELECT status, properties FROM objects WHERE id = ?', String(row.target_id));
+            if (target?.status !== 'candidate')
+                throw new Error('Only conflicts on candidates can be resolved.');
+            if (choice === 'other') {
+                const properties = parseJson(target.properties);
+                properties[String(row.field)] = parseJson(row.other);
+                this.run('UPDATE objects SET properties = ?, updated_at = ? WHERE id = ?', JSON.stringify(properties), now(), String(row.target_id));
+            }
+            this.run('UPDATE conflicts SET resolution = ? WHERE id = ?', JSON.stringify({ choice, authorization: auth }), conflictId);
+            this.audit(projectId, 'conflict.resolve', { conflictId, targetId: row.target_id, field: row.field, choice, authorization: auth });
+            return { conflictId, choice };
+        });
+    }
+    /** Similar-looking same-type objects, excluding pairs the user said are distinct. */
+    duplicates(projectId, opts) {
+        const schema = this.published(projectId)?.schema;
+        if (!schema)
+            throw new Error('No published schema.');
+        const titles = new Map(schema.objectTypes.map(t => [t.apiName, t.titleProperty ?? t.primaryKey]));
+        const items = this.objects(projectId, { type: opts.type }).map(o => ({ id: o.id, type: o.type, label: String(o.properties[titles.get(o.type) ?? ''] ?? o.key) }));
+        const distinct = new Set(this.all('SELECT a, b FROM distinct_pairs WHERE project_id = ?', projectId).map(r => `${r.a}|${r.b}`));
+        return suggestDuplicates(items, opts.threshold, opts.limit * 4).filter(p => !distinct.has([p.a, p.b].sort().join('|'))).slice(0, opts.limit);
+    }
+    markDistinct(projectId, a, b) {
+        const [x, y] = [a, b].sort();
+        this.tx(() => {
+            this.run('INSERT OR IGNORE INTO distinct_pairs (project_id, a, b, created_at) VALUES (?, ?, ?, ?)', projectId, x, y, now());
+            this.audit(projectId, 'resolve.distinct', { a: x, b: y });
+        });
+    }
+    /**
+     * Merge `dropId` into `keepId`: evidence and links move over, missing values
+     * are filled in and differing ones become conflicts, and the dropped key is
+     * kept as an alias so later batches resolve to the survivor.
+     */
+    mergeObjects(projectId, keepId, dropId, auth) {
+        assertAuthorized(auth);
+        return this.tx(() => {
+            if (keepId === dropId)
+                throw new Error('Cannot merge an object with itself.');
+            const keep = this.get('SELECT * FROM objects WHERE project_id = ? AND id = ?', projectId, keepId);
+            const drop = this.get('SELECT * FROM objects WHERE project_id = ? AND id = ?', projectId, dropId);
+            if (!keep || !drop)
+                throw new Error('Both objects must exist.');
+            if (keep.type !== drop.type)
+                throw new Error('Only objects of the same type can be merged.');
+            if (drop.status !== 'candidate')
+                throw new Error('The merged-away object must be a candidate; confirmed objects are never deleted.');
+            if (keep.status === 'rejected')
+                throw new Error('Cannot merge into a rejected object.');
+            const at = now();
+            const batches = this.all('SELECT DISTINCT batch_id FROM evidence WHERE target_id IN (?, ?) UNION SELECT batch_id FROM objects WHERE id IN (?, ?)', keepId, dropId, keepId, dropId).map(r => String(r.batch_id));
+            const properties = parseJson(keep.properties);
+            const before = { keep: { ...properties }, drop: parseJson(drop.properties) };
+            const type = this.published(projectId)?.schema.objectTypes.find(t => t.apiName === keep.type);
+            let conflicts = 0;
+            for (const [field, value] of Object.entries(before.drop)) {
+                if (value === null || value === undefined || field === type?.primaryKey)
+                    continue;
+                if (properties[field] === undefined || properties[field] === null)
+                    properties[field] = value;
+                else if (canonicalJson(properties[field]) !== canonicalJson(value)) {
+                    this.addConflict(projectId, keepId, field, properties[field], value, null, at);
+                    conflicts++;
+                }
+            }
+            if (keep.status === 'confirmed' && (conflicts || canonicalJson(properties) !== canonicalJson(before.keep)))
+                throw new Error('The kept object is confirmed and the merge would change it; merge the other way or reject the duplicate.');
+            this.run('UPDATE objects SET properties = ?, updated_at = ? WHERE id = ?', JSON.stringify(properties), at, keepId);
+            this.run('UPDATE evidence SET target_id = ? WHERE target_id = ?', keepId, dropId);
+            this.run('UPDATE conflicts SET target_id = ? WHERE target_id = ?', keepId, dropId);
+            let droppedLinks = 0;
+            for (const link of this.all('SELECT id, link_type, from_id, to_id FROM links WHERE project_id = ? AND (from_id = ? OR to_id = ?)', projectId, dropId, dropId)) {
+                const from = link.from_id === dropId ? keepId : String(link.from_id);
+                const to = link.to_id === dropId ? keepId : String(link.to_id);
+                const twin = this.get('SELECT id FROM links WHERE project_id = ? AND link_type = ? AND from_id = ? AND to_id = ? AND id != ?', projectId, String(link.link_type), from, to, String(link.id));
+                if (twin) {
+                    this.run('UPDATE evidence SET target_id = ? WHERE target_id = ?', String(twin.id), String(link.id));
+                    this.run('DELETE FROM links WHERE id = ?', String(link.id));
+                    droppedLinks++;
+                }
+                else
+                    this.run('UPDATE links SET from_id = ?, to_id = ?, updated_at = ? WHERE id = ?', from, to, at, String(link.id));
+            }
+            for (const link of this.all('SELECT id, code_ref, relation FROM code_links WHERE object_id = ?', dropId)) {
+                const twin = this.get('SELECT id FROM code_links WHERE object_id = ? AND code_ref = ? AND relation = ?', keepId, String(link.code_ref), String(link.relation));
+                if (twin) {
+                    this.run('UPDATE evidence SET target_id = ? WHERE target_id = ?', String(twin.id), String(link.id));
+                    this.run('DELETE FROM code_links WHERE id = ?', String(link.id));
+                }
+                else
+                    this.run('UPDATE code_links SET object_id = ?, updated_at = ? WHERE id = ?', keepId, at, String(link.id));
+            }
+            this.run('UPDATE aliases SET object_id = ? WHERE object_id = ?', keepId, dropId);
+            this.run("INSERT OR REPLACE INTO aliases (project_id, type, norm_key, object_id, origin, created_at) VALUES (?, ?, ?, ?, 'merge', ?)", projectId, String(keep.type), normalizeKey(String(drop.key)), keepId, at);
+            this.run('DELETE FROM merges WHERE object_id = ?', dropId);
+            this.run('DELETE FROM objects WHERE id = ?', dropId);
+            this.run('INSERT INTO entity_merges (id, project_id, keep_id, drop_id, drop_key, batches, before, authorization, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', newId('mrg'), projectId, keepId, dropId, String(drop.key), JSON.stringify(batches), JSON.stringify(before), JSON.stringify(auth), at);
+            this.audit(projectId, 'resolve.merge', { keepId, dropId, dropKey: drop.key, conflicts, droppedLinks, authorization: auth });
+            return { keepId, dropId, alias: String(drop.key), conflicts, droppedLinks };
+        });
+    }
+    /**
+     * Store one code analysis. Each source file becomes a read-only material, so
+     * code facts carry the same verifiable evidence as document facts. Snapshots
+     * are append-only; the latest one is what queries and checks use.
+     */
+    addCodeSnapshot(projectId, root, files, graph) {
+        return this.tx(() => {
+            const id = newId('snp');
+            const at = now();
+            const materialOf = new Map();
+            let created = 0;
+            for (const f of files) {
+                if (!graph.modules.some(m => m.path === f.path))
+                    continue;
+                const hash = sha256(f.text);
+                const existing = this.get('SELECT id FROM materials WHERE project_id = ? AND sha256 = ?', projectId, hash);
+                const mid = existing ? String(existing.id) : newId('mat');
+                if (!existing) {
+                    this.run('INSERT INTO materials (id, project_id, name, sha256, text, created_at) VALUES (?, ?, ?, ?, ?, ?)', mid, projectId, `code:${f.path}`, hash, f.text, at);
+                    created++;
+                }
+                materialOf.set(f.path, mid);
+            }
+            const textOf = new Map(files.map(f => [f.path, f.text]));
+            const line = (path, offset) => lineAt(textOf.get(path) ?? '', offset);
+            const stats = { modules: graph.modules.length, symbols: graph.symbols.length, imports: graph.imports.length, calls: graph.calls.length, skipped: graph.skipped.length };
+            this.run('INSERT INTO code_snapshots (id, project_id, root, files, stats, created_at) VALUES (?, ?, ?, ?, ?, ?)', id, projectId, root, files.length, JSON.stringify(stats), at);
+            for (const m of graph.modules)
+                this.run('INSERT INTO code_modules (snapshot_id, path, language, material_id, lines) VALUES (?, ?, ?, ?, ?)', id, m.path, m.language, materialOf.get(m.path), m.lines);
+            for (const s of graph.symbols) {
+                this.run('INSERT INTO code_symbols (snapshot_id, qualified_name, name, kind, module, container, start_offset, end_offset, line) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', id, s.qualifiedName, s.name, s.kind, s.module, s.container, s.line.start, s.line.end, line(s.module, s.line.start));
+            }
+            for (const [kind, edges] of [['imports', graph.imports], ['calls', graph.calls]]) {
+                for (const e of edges) {
+                    const module = e.from.split('#')[0];
+                    this.run('INSERT OR IGNORE INTO code_edges (snapshot_id, kind, source, target, start_offset, end_offset, line) VALUES (?, ?, ?, ?, ?, ?, ?)', id, kind, e.from, e.to, e.line.start, e.line.end, line(module, e.line.start));
+                }
+            }
+            this.audit(projectId, 'code.snapshot', { id, root, files: files.length, materials: { created, reused: materialOf.size - created }, stats });
+            return { snapshotId: id, materials: { created, reused: materialOf.size - created }, stats };
+        });
+    }
+    latestSnapshot(projectId) {
+        const row = this.get('SELECT id, root, stats, created_at FROM code_snapshots WHERE project_id = ? ORDER BY rowid DESC LIMIT 1', projectId);
+        return row && { id: String(row.id), root: String(row.root), createdAt: String(row.created_at), stats: parseJson(row.stats) };
+    }
+    codeRefExists(projectId, ref) {
+        return this.codeElement(projectId, ref) !== undefined;
+    }
+    /** Code element in the latest snapshot, with the material and span that prove it exists. */
+    codeElement(projectId, ref) {
+        const snap = this.latestSnapshot(projectId);
+        if (!snap)
+            return undefined;
+        if (ref.includes('#')) {
+            const r = this.get('SELECT s.*, m.material_id FROM code_symbols s JOIN code_modules m ON m.snapshot_id = s.snapshot_id AND m.path = s.module WHERE s.snapshot_id = ? AND s.qualified_name = ?', snap.id, ref);
+            return r && { ref, kind: String(r.kind), module: String(r.module), materialId: String(r.material_id), start: Number(r.start_offset), end: Number(r.end_offset), line: Number(r.line) };
+        }
+        const r = this.get('SELECT material_id FROM code_modules WHERE snapshot_id = ? AND path = ?', snap.id, ref);
+        return r && { ref, kind: 'module', module: ref, materialId: String(r.material_id), start: 0, end: 0, line: 1 };
+    }
+    /** Search the latest snapshot's symbols by name fragment. */
+    searchCode(projectId, query) {
+        const snap = this.latestSnapshot(projectId);
+        if (!snap)
+            throw new Error('No code snapshot; run ontology_code_scan first.');
+        const like = `%${(query.text ?? '').replace(/[%_\\]/g, c => `\\${c}`)}%`;
+        const symbols = this.all(`SELECT qualified_name, name, kind, module, container, line FROM code_symbols WHERE snapshot_id = ? AND (name LIKE ? ESCAPE '\\' OR qualified_name LIKE ? ESCAPE '\\')
+      AND (? IS NULL OR kind = ?) AND (? IS NULL OR module = ?) ORDER BY length(name), qualified_name LIMIT ?`, snap.id, like, like, query.kind ?? null, query.kind ?? null, query.module ?? null, query.module ?? null, query.limit);
+        return { snapshotId: snap.id, symbols: symbols.map(r => ({ ref: String(r.qualified_name), name: String(r.name), kind: String(r.kind), module: String(r.module), container: r.container === null ? null : String(r.container), line: Number(r.line) })) };
+    }
+    /** Imports/calls touching one code element, in either direction. */
+    codeNeighbors(projectId, ref, limit) {
+        const snap = this.latestSnapshot(projectId);
+        if (!snap)
+            throw new Error('No code snapshot; run ontology_code_scan first.');
+        const rows = (dir) => this.all(`SELECT kind, source, target, line FROM code_edges WHERE snapshot_id = ? AND ${dir} = ? ORDER BY kind, ${dir === 'source' ? 'target' : 'source'} LIMIT ?`, snap.id, ref, limit);
+        const map = (r) => ({ kind: String(r.kind), source: String(r.source), target: String(r.target), line: Number(r.line) });
+        return { outgoing: rows('source').map(map), incoming: rows('target').map(map) };
+    }
+    /**
+     * Propose links from ontology objects to code elements. The evidence is the
+     * code itself (role `observed`), located in the file's material. The link
+     * stays a candidate until reviewed like any other.
+     */
+    assertCodeLinks(projectId, extractor, items) {
+        const published = this.published(projectId);
+        if (!published)
+            throw new Error('Publish a schema version first.');
+        const batchId = newId('bat');
+        const at = now();
+        return this.tx(() => {
+            this.run('INSERT INTO batches (id, project_id, extractor, schema_version, created_at) VALUES (?, ?, ?, ?, ?)', batchId, projectId, extractor, published.version, at);
+            const results = items.map((item, index) => {
+                const issues = [];
+                const object = this.get('SELECT status FROM objects WHERE project_id = ? AND id = ?', projectId, String(item?.objectId));
+                if (!object)
+                    issues.push(issue('UNKNOWN_OBJECT', 'objectId', `No object "${item?.objectId}".`));
+                else if (object.status === 'rejected')
+                    issues.push(issue('REJECTED_ENDPOINT', 'objectId', 'Object was rejected.'));
+                const element = this.codeElement(projectId, String(item?.codeRef));
+                if (!element)
+                    issues.push(issue('UNKNOWN_CODE_REF', 'codeRef', `"${item?.codeRef}" is not in the latest code snapshot; use ontology_code_search.`));
+                if (typeof item?.relation !== 'string' || !/^[a-z][a-zA-Z]*$/.test(item.relation))
+                    issues.push(issue('INVALID_RELATION', 'relation', 'relation must be a camelCase word, e.g. implementedBy.'));
+                if (issues.length)
+                    return { index, outcome: 'failed', issues };
+                // By default the evidence is the symbol's own declaration line.
+                const text = String(this.get('SELECT text FROM materials WHERE id = ?', element.materialId).text);
+                const own = item.quote !== undefined || element.end > element.start
+                    ? [{ materialId: element.materialId, quote: item.quote ?? text.slice(element.start, element.end), role: 'observed', near: element.start }]
+                    : [];
+                const evidence = this.checkEvidence(projectId, [...own, ...(item.evidence ?? [])], field => field === undefined, issues);
+                if (issues.some(i => i.severity === 'blocking'))
+                    return { index, outcome: 'failed', issues };
+                const existing = this.get('SELECT id, status FROM code_links WHERE project_id = ? AND object_id = ? AND code_ref = ? AND relation = ?', projectId, item.objectId, item.codeRef, item.relation);
+                if (existing?.status === 'rejected')
+                    return { index, outcome: 'failed', id: String(existing.id), issues: [issue('PREVIOUSLY_REJECTED', 'link', 'This code link was rejected before.')] };
+                const id = existing ? String(existing.id) : newId('cln');
+                if (!existing)
+                    this.run("INSERT INTO code_links (id, project_id, object_id, code_ref, relation, status, batch_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'candidate', ?, ?, ?)", id, projectId, item.objectId, item.codeRef, item.relation, batchId, at, at);
+                this.insertEvidence(projectId, batchId, id, evidence, at);
+                return { index, outcome: existing ? 'merged' : 'created', id, issues };
+            });
+            this.audit(projectId, 'code.link', { batchId, extractor, results: tally(results) });
+            return { batchId, results };
+        });
+    }
+    codeLinks(projectId, filter = {}) {
+        const statuses = filter.status?.length ? filter.status : ['candidate', 'confirmed'];
+        const marks = statuses.map(() => '?').join(', ');
+        return this.all(`SELECT * FROM code_links WHERE project_id = ? AND (? IS NULL OR object_id = ?) AND status IN (${marks}) ORDER BY rowid`, projectId, filter.objectId ?? null, filter.objectId ?? null, ...statuses)
+            .map(r => ({ id: String(r.id), objectId: String(r.object_id), codeRef: String(r.code_ref), relation: String(r.relation), status: r.status, batchId: String(r.batch_id), stale: !this.codeRefExists(projectId, String(r.code_ref)) }));
+    }
+    /** Save the ObjectSet query that answers a competency question, and what counts as answered. */
+    setQuestionQuery(projectId, questionId, query, expect) {
+        const schema = this.published(projectId)?.schema;
+        if (!schema)
+            throw new Error('Publish a schema version first.');
+        if (!schema.questions.some(q => q.id === questionId))
+            throw new Error(`Question "${questionId}" is not in the published schema.`);
+        if (!Number.isInteger(expect?.minResults) || expect.minResults < 0)
+            throw new Error('expect.minResults must be an integer ≥ 0.');
+        if (expect.includes !== undefined && (!Array.isArray(expect.includes) || expect.includes.some(k => typeof k !== 'string')))
+            throw new Error('expect.includes must list primary keys as strings.');
+        // Fail early on a query that cannot run against the schema.
+        runQuery({ schema, objects: [], links: [] }, { ...query, status: ['confirmed'] });
+        this.tx(() => {
+            this.run('INSERT OR REPLACE INTO question_queries (project_id, question_id, query, expect, updated_at) VALUES (?, ?, ?, ?, ?)', projectId, questionId, JSON.stringify(query), JSON.stringify(expect), now());
+            this.audit(projectId, 'question.query', { questionId, query, expect });
+        });
+    }
+    /**
+     * Run every saved question query against confirmed data and record the
+     * outcome. A question that passed in its previous run and fails now is a
+     * regression.
+     */
+    runQuestions(projectId) {
+        const published = this.published(projectId);
+        if (!published)
+            throw new Error('No published schema.');
+        const data = { schema: published.schema, objects: this.objects(projectId, { status: ['confirmed'] }), links: this.links(projectId, { status: ['confirmed'] }) };
+        const saved = new Map(this.all('SELECT question_id, query, expect FROM question_queries WHERE project_id = ?', projectId).map(r => [String(r.question_id), { query: parseJson(r.query), expect: parseJson(r.expect) }]));
+        return this.tx(() => published.schema.questions.map((q) => {
+            const entry = saved.get(q.id);
+            const base = { questionId: q.id, text: q.text, priority: q.priority };
+            if (!entry)
+                return { ...base, status: 'no-query', regression: false };
+            const previous = this.get('SELECT passed FROM question_runs WHERE project_id = ? AND question_id = ? ORDER BY seq DESC LIMIT 1', projectId, q.id);
+            let outcome;
+            try {
+                const result = runQuery(data, { ...entry.query, status: ['confirmed'], limit: 500 });
+                const keys = 'objects' in result ? result.objects.map(o => o.key) : [];
+                const missing = (entry.expect.includes ?? []).filter(k => !keys.includes(k));
+                outcome = { status: result.total >= entry.expect.minResults && !missing.length ? 'pass' : 'fail', total: result.total, missing };
+            }
+            catch (error) {
+                outcome = { status: 'error', error: error.message };
+            }
+            const passed = outcome.status === 'pass';
+            this.run('INSERT INTO question_runs (project_id, question_id, schema_version, result, passed, at) VALUES (?, ?, ?, ?, ?, ?)', projectId, q.id, published.version, JSON.stringify(outcome), passed ? 1 : 0, now());
+            return { ...base, ...outcome, regression: !passed && Number(previous?.passed) === 1 };
+        }));
+    }
+    /** Problems left after the final attempt of every logged extraction chunk. */
+    droppedByValidation(projectId) {
+        return Number(this.get('SELECT coalesce(sum(json_array_length(problems)), 0) AS n FROM extraction_runs WHERE project_id = ?', projectId)?.n ?? 0);
+    }
+    /** Store a rule the user approved. A rule only ever widens confirmation; it cannot skip the confirm checks. */
+    addRule(projectId, definition, auth) {
+        assertAuthorized(auth);
+        const problems = this.ruleProblems(projectId, definition);
+        if (problems.length)
+            throw new Error(`Invalid rule: ${problems.join(' ')}`);
+        const id = newId('rul');
+        this.tx(() => {
+            this.run("INSERT INTO rules (id, project_id, definition, status, authorization, created_at) VALUES (?, ?, ?, 'active', ?, ?)", id, projectId, JSON.stringify(definition), JSON.stringify(auth), now());
+            this.audit(projectId, 'rule.add', { id, definition, authorization: auth });
+        });
+        return this.rule(projectId, id);
+    }
+    ruleProblems(projectId, d) {
+        const schema = this.published(projectId)?.schema;
+        if (!schema)
+            return ['No published schema.'];
+        const problems = [];
+        if (!d || typeof d.name !== 'string' || !d.name.trim())
+            problems.push('name is required.');
+        if (!!d.objectType === !!d.linkType)
+            problems.push('Give exactly one of objectType or linkType.');
+        const type = d.objectType ? schema.objectTypes.find(t => t.apiName === d.objectType) : undefined;
+        if (d.objectType && !type)
+            problems.push(`Unknown object type "${d.objectType}".`);
+        if (d.linkType && !schema.linkTypes.some(l => l.apiName === d.linkType))
+            problems.push(`Unknown link type "${d.linkType}".`);
+        if (!Array.isArray(d.roles) || !d.roles.length || d.roles.some(r => !EVIDENCE_ROLES.includes(r)))
+            problems.push('roles must list evidence roles.');
+        if (d.roles?.includes('inferred'))
+            problems.push('Inferred evidence can never confirm automatically.');
+        if (!Number.isInteger(d.minEvidence) || d.minEvidence < 1)
+            problems.push('minEvidence must be an integer ≥ 1.');
+        if (!Number.isInteger(d.minSources) || d.minSources < 1)
+            problems.push('minSources must be an integer ≥ 1.');
+        if (!(d.sampleRate > 0 && d.sampleRate <= 1))
+            problems.push('sampleRate must be in (0, 1]; every rule is spot-checked.');
+        if (!(d.minAccuracy > 0 && d.minAccuracy <= 1))
+            problems.push('minAccuracy must be in (0, 1].');
+        if (!Number.isInteger(d.minSamples) || d.minSamples < 1)
+            problems.push('minSamples must be an integer ≥ 1.');
+        if (d.extractors !== undefined && (!Array.isArray(d.extractors) || d.extractors.some(e => typeof e !== 'string')))
+            problems.push('extractors must be a list of strings.');
+        if (d.where !== undefined) {
+            if (!type)
+                problems.push('where is only supported for object rules.');
+            else
+                try {
+                    compileFilter(d.where, new Set(type.properties.map(p => p.apiName)));
+                }
+                catch (error) {
+                    problems.push(`where: ${error.message}`);
+                }
+        }
+        return problems;
+    }
+    rule(projectId, id) {
+        const row = this.get('SELECT * FROM rules WHERE project_id = ? AND id = ?', projectId, id);
+        if (!row)
+            throw new Error(`Unknown rule "${id}".`);
+        return { id: String(row.id), definition: parseJson(row.definition), status: row.status, disabledReason: row.disabled_reason === null ? null : String(row.disabled_reason), createdAt: String(row.created_at) };
+    }
+    rules(projectId) {
+        return this.all('SELECT id FROM rules WHERE project_id = ? ORDER BY rowid', projectId).map(r => {
+            const rule = this.rule(projectId, String(r.id));
+            return { ...rule, stats: this.ruleStats(rule.id) };
+        });
+    }
+    ruleStats(ruleId) {
+        const confirmed = Number(this.get("SELECT count(*) AS n FROM audit, json_each(json_extract(audit.detail, '$.ids')) WHERE audit.action = 'rule.confirm' AND json_extract(audit.detail, '$.ruleId') = ?", ruleId)?.n ?? 0);
+        const row = this.get("SELECT count(*) AS samples, count(verdict) AS judged, coalesce(sum(verdict = 'correct'), 0) AS correct FROM rule_samples WHERE rule_id = ?", ruleId);
+        const judged = Number(row?.judged ?? 0);
+        const correct = Number(row?.correct ?? 0);
+        return { confirmed, samples: Number(row?.samples ?? 0), judged, correct, accuracy: judged ? correct / judged : null };
+    }
+    disableRule(projectId, id, reason) {
+        this.tx(() => {
+            this.rule(projectId, id);
+            this.run("UPDATE rules SET status = 'disabled', disabled_reason = ? WHERE id = ?", reason, id);
+            this.audit(projectId, 'rule.disable', { id, reason });
+        });
+    }
+    /** Candidates an active rule would confirm now: they match the rule and pass every confirm check. */
+    ruleMatches(projectId, ruleId) {
+        const rule = this.rule(projectId, ruleId);
+        return rule.status === 'active' ? this.matchDefinition(projectId, rule.definition) : { ready: [], blocked: [] };
+    }
+    /** What a (possibly not yet approved) rule definition would confirm right now. */
+    matchDefinition(projectId, d) {
+        const problems = this.ruleProblems(projectId, d);
+        if (problems.length)
+            throw new Error(`Invalid rule: ${problems.join(' ')}`);
+        const schema = this.published(projectId).schema;
+        const props = new Set(schema.objectTypes.find(t => t.apiName === d.objectType)?.properties.map(p => p.apiName));
+        const where = d.where ? compileFilter(d.where, props) : () => true;
+        const candidates = d.objectType
+            ? this.objects(projectId, { type: d.objectType, status: ['candidate'] }).filter(where).map(o => o.id)
+            : this.links(projectId, { linkType: d.linkType, status: ['candidate'] }).map(l => l.id);
+        const qualifying = candidates.filter(id => {
+            const ev = this.all('SELECT e.material_id, e.role, b.extractor FROM evidence e JOIN batches b ON b.id = e.batch_id WHERE e.target_id = ?', id)
+                .filter(e => d.roles.includes(e.role) && (!d.extractors?.length || d.extractors.includes(String(e.extractor))));
+            return ev.length >= d.minEvidence && new Set(ev.map(e => e.material_id)).size >= d.minSources;
+        });
+        return this.previewConfirm(projectId, qualifying);
+    }
+    /**
+     * Confirm what an active rule matches. Authorization is the rule's own
+     * stored approval. A deterministic share of confirmations is queued for
+     * spot checks; a rule whose judged accuracy falls below its bar disables itself.
+     */
+    applyRule(projectId, ruleId) {
+        return this.tx(() => {
+            const rule = this.rule(projectId, ruleId);
+            if (rule.status !== 'active')
+                throw new Error(`Rule is ${rule.status}: ${rule.disabledReason ?? ''}`);
+            const row = this.get('SELECT authorization FROM rules WHERE id = ?', ruleId);
+            const auth = { kind: 'rule', ruleId, approval: parseJson(row?.authorization) };
+            assertAuthorized(auth.approval);
+            const preview = this.ruleMatches(projectId, ruleId);
+            this.setStatus(projectId, preview.ready, 'confirmed', auth);
+            const at = now();
+            const sampled = preview.ready.filter(id => sampleScore(ruleId, id) < rule.definition.sampleRate);
+            // Guarantee at least one spot check per application.
+            if (preview.ready.length && !sampled.length)
+                sampled.push(preview.ready.reduce((a, b) => (sampleScore(ruleId, a) <= sampleScore(ruleId, b) ? a : b)));
+            for (const id of sampled)
+                this.run('INSERT OR IGNORE INTO rule_samples (rule_id, target_id, created_at) VALUES (?, ?, ?)', ruleId, id, at);
+            this.audit(projectId, 'rule.confirm', { ruleId, ids: preview.ready, sampled, authorization: auth });
+            return { confirmed: preview.ready, sampled, blocked: preview.blocked };
+        });
+    }
+    /** Spot checks waiting for a human verdict. */
+    pendingSamples(projectId, ruleId) {
+        const rows = this.all('SELECT s.rule_id, s.target_id FROM rule_samples s JOIN rules r ON r.id = s.rule_id WHERE r.project_id = ? AND s.verdict IS NULL ORDER BY s.rowid', projectId);
+        return rows.map(r => ({ ruleId: String(r.rule_id), targetId: String(r.target_id) })).filter(r => !ruleId || r.ruleId === ruleId);
+    }
+    /**
+     * Record a spot-check verdict. A wrong record goes back to candidate; the
+     * rule is disabled once its accuracy over judged samples is too low.
+     */
+    judgeSample(projectId, ruleId, targetId, verdict, note, auth) {
+        assertAuthorized(auth);
+        return this.tx(() => {
+            const rule = this.rule(projectId, ruleId);
+            const row = this.get('SELECT verdict FROM rule_samples WHERE rule_id = ? AND target_id = ?', ruleId, targetId);
+            if (!row)
+                throw new Error('No such spot check.');
+            if (row.verdict !== null)
+                throw new Error('Already judged.');
+            this.run('UPDATE rule_samples SET verdict = ?, note = ?, judged_at = ? WHERE rule_id = ? AND target_id = ?', verdict, note, now(), ruleId, targetId);
+            if (verdict === 'wrong') {
+                // Links built on a wrong object lose their footing too.
+                const links = this.all("SELECT id FROM links WHERE project_id = ? AND status = 'confirmed' AND (from_id = ? OR to_id = ?)", projectId, targetId, targetId).map(r => String(r.id));
+                this.setStatus(projectId, [targetId, ...links], 'candidate', { kind: 'spot-check', ruleId, note });
+            }
+            const stats = this.ruleStats(ruleId);
+            let disabled = false;
+            if (rule.status === 'active' && stats.judged >= rule.definition.minSamples && stats.accuracy < rule.definition.minAccuracy) {
+                const reason = `Spot-check accuracy ${(stats.accuracy * 100).toFixed(0)}% over ${stats.judged} samples is below ${(rule.definition.minAccuracy * 100).toFixed(0)}%.`;
+                this.run("UPDATE rules SET status = 'disabled', disabled_reason = ? WHERE id = ?", reason, ruleId);
+                this.audit(projectId, 'rule.disable', { id: ruleId, reason });
+                disabled = true;
+            }
+            this.audit(projectId, 'rule.judge', { ruleId, targetId, verdict, note, authorization: auth });
+            return { verdict, stats, disabled };
+        });
+    }
+    cardinalityIssues(projectId, def, fromId, toId, statuses, severity) {
+        const issues = [];
+        const marks = statuses.map(() => '?').join(', ');
+        const singleTarget = def.cardinality === 'one-to-one' || def.cardinality === 'many-to-one';
+        const singleSource = def.cardinality === 'one-to-one' || def.cardinality === 'one-to-many';
+        if (singleTarget && this.get(`SELECT 1 FROM links WHERE project_id = ? AND link_type = ? AND from_id = ? AND to_id != ? AND status IN (${marks})`, projectId, def.apiName, fromId, toId, ...statuses)) {
+            issues.push(issue('CARDINALITY', 'from', `${def.apiName} is ${def.cardinality}: the source already has another ${def.apiName} link.`, severity));
+        }
+        if (singleSource && this.get(`SELECT 1 FROM links WHERE project_id = ? AND link_type = ? AND to_id = ? AND from_id != ? AND status IN (${marks})`, projectId, def.apiName, toId, fromId, ...statuses)) {
+            issues.push(issue('CARDINALITY', 'to', `${def.apiName} is ${def.cardinality}: the target already has another ${def.inverseApiName} link.`, severity));
+        }
+        return issues;
+    }
+    /**
+     * Which of `ids` may be confirmed right now. An object needs valid values
+     * under the latest schema, all required properties, and at least one
+     * non-inferred quote. A link additionally needs both endpoints confirmed (or
+     * confirmed in the same call) and must respect cardinality among confirmed links.
+     */
+    previewConfirm(projectId, ids) {
+        const schema = this.published(projectId)?.schema;
+        if (!schema)
+            throw new Error('No published schema.');
+        const types = new Map(schema.objectTypes.map(t => [t.apiName, t]));
+        const linkTypes = new Map(schema.linkTypes.map(l => [l.apiName, l]));
+        const wanted = new Set(ids);
+        const ready = [];
+        const blocked = [];
+        const objectsReady = new Set();
+        const roles = (id) => this.all('SELECT role FROM evidence WHERE project_id = ? AND target_id = ?', projectId, id).map(r => String(r.role));
+        const evidenceIssues = (id) => {
+            const issues = roles(id).some(r => r !== 'inferred') ? [] : [issue('ONLY_INFERRED', 'evidence', 'Only inferred evidence; inferred assertions are never auto-confirmed. Add a direct quote first.')];
+            const open = Number(this.get('SELECT count(*) AS n FROM conflicts WHERE project_id = ? AND target_id = ? AND resolution IS NULL', projectId, id)?.n);
+            if (open)
+                issues.push(issue('UNRESOLVED_CONFLICT', 'properties', `${open} conflicting value(s) from other sources; resolve them first.`));
+            return issues;
+        };
+        const decide = (id, issues) => {
+            if (issues.length)
+                blocked.push({ id, issues });
+            else
+                ready.push(id);
+        };
+        const objectIds = ids.filter(id => id.startsWith('obj_'));
+        for (const id of objectIds) {
+            const row = this.get('SELECT type, properties, status FROM objects WHERE project_id = ? AND id = ?', projectId, id);
+            if (!row) {
+                decide(id, [issue('UNKNOWN_RECORD', 'id', `No object "${id}".`)]);
+                continue;
+            }
+            if (row.status !== 'candidate') {
+                decide(id, [issue('NOT_CANDIDATE', 'status', `Object is already ${row.status}.`)]);
+                continue;
+            }
+            const type = types.get(String(row.type));
+            const issues = type ? validateProperties(type, JSON.parse(String(row.properties))) : [issue('UNKNOWN_TYPE', 'type', `Type ${row.type} is not in the latest schema.`)];
+            issues.forEach(i => { i.severity = 'blocking'; });
+            issues.push(...evidenceIssues(id));
+            if (!issues.length)
+                objectsReady.add(id);
+            decide(id, issues);
+        }
+        const pending = [];
+        for (const id of ids.filter(id => id.startsWith('cln_'))) {
+            const row = this.get('SELECT object_id, code_ref, status FROM code_links WHERE project_id = ? AND id = ?', projectId, id);
+            if (!row) {
+                decide(id, [issue('UNKNOWN_RECORD', 'id', `No code link "${id}".`)]);
+                continue;
+            }
+            if (row.status !== 'candidate') {
+                decide(id, [issue('NOT_CANDIDATE', 'status', `Code link is already ${row.status}.`)]);
+                continue;
+            }
+            const issues = evidenceIssues(id);
+            const status = this.get('SELECT status FROM objects WHERE id = ?', String(row.object_id))?.status;
+            if (status !== 'confirmed' && !objectsReady.has(String(row.object_id)))
+                issues.push(issue('ENDPOINT_NOT_CONFIRMED', 'object', `Confirm object ${row.object_id} first or in the same call.`));
+            if (!this.codeRefExists(projectId, String(row.code_ref)))
+                issues.push(issue('STALE_CODE_REF', 'codeRef', `${row.code_ref} is not in the latest code snapshot.`));
+            decide(id, issues);
+        }
+        for (const id of ids.filter(id => !id.startsWith('obj_') && !id.startsWith('cln_'))) {
+            const row = this.get('SELECT link_type, from_id, to_id, status FROM links WHERE project_id = ? AND id = ?', projectId, id);
+            if (!row) {
+                decide(id, [issue('UNKNOWN_RECORD', 'id', `No object or link "${id}".`)]);
+                continue;
+            }
+            if (row.status !== 'candidate') {
+                decide(id, [issue('NOT_CANDIDATE', 'status', `Link is already ${row.status}.`)]);
+                continue;
+            }
+            const def = linkTypes.get(String(row.link_type));
+            if (!def) {
+                decide(id, [issue('UNKNOWN_LINK_TYPE', 'linkType', `Link type ${row.link_type} is not in the latest schema.`)]);
+                continue;
+            }
+            const from = String(row.from_id);
+            const to = String(row.to_id);
+            const issues = evidenceIssues(id);
+            for (const [side, endpoint] of [['from', from], ['to', to]]) {
+                const status = this.get('SELECT status FROM objects WHERE id = ?', endpoint)?.status;
+                if (status !== 'confirmed' && !objectsReady.has(endpoint))
+                    issues.push(issue('ENDPOINT_NOT_CONFIRMED', side, wanted.has(endpoint) ? `Endpoint ${endpoint} cannot be confirmed yet.` : `Confirm endpoint ${endpoint} first or in the same call.`));
+            }
+            issues.push(...this.cardinalityIssues(projectId, def, from, to, ['confirmed'], 'blocking'));
+            // Two links in this same call can also break cardinality.
+            for (const other of pending) {
+                if (other.def.apiName !== def.apiName)
+                    continue;
+                const singleTarget = def.cardinality === 'one-to-one' || def.cardinality === 'many-to-one';
+                const singleSource = def.cardinality === 'one-to-one' || def.cardinality === 'one-to-many';
+                if ((singleTarget && other.from === from && other.to !== to) || (singleSource && other.to === to && other.from !== from))
+                    issues.push(issue('CARDINALITY', 'link', `Conflicts with another ${def.apiName} link in this call (${def.cardinality}).`));
+            }
+            if (!issues.length)
+                pending.push({ from, to, def });
+            decide(id, issues);
+        }
+        return { ready, blocked };
+    }
+    /** Confirm the ready subset of `ids`; blocked ones are returned untouched. */
+    confirm(projectId, ids, auth) {
+        assertAuthorized(auth);
+        return this.tx(() => {
+            const preview = this.previewConfirm(projectId, ids);
+            this.setStatus(projectId, preview.ready, 'confirmed', auth);
+            this.audit(projectId, 'review.confirm', { ids: preview.ready, blocked: preview.blocked.map(b => b.id), authorization: auth });
+            return preview;
+        });
+    }
+    /** Reject candidates. Rejected keys are remembered so later batches cannot re-add them silently. */
+    reject(projectId, ids, note, auth) {
+        assertAuthorized(auth);
+        return this.tx(() => {
+            const rejected = [];
+            const skipped = [];
+            for (const id of ids) {
+                const table = tableOf(id);
+                const row = this.get(`SELECT status FROM ${table} WHERE project_id = ? AND id = ?`, projectId, id);
+                if (row?.status === 'candidate')
+                    rejected.push(id);
+                else
+                    skipped.push(id);
+            }
+            // Candidate links hanging off a rejected object go with it; confirmed ones would be left dangling.
+            for (const id of rejected.filter(id => id.startsWith('obj_'))) {
+                for (const link of this.all("SELECT id FROM links WHERE project_id = ? AND status = 'candidate' AND (from_id = ? OR to_id = ?) UNION SELECT id FROM code_links WHERE project_id = ? AND status = 'candidate' AND object_id = ?", projectId, id, id, projectId, id)) {
+                    if (!rejected.includes(String(link.id)))
+                        rejected.push(String(link.id));
+                }
+                if (this.get("SELECT 1 FROM links WHERE project_id = ? AND status = 'confirmed' AND (from_id = ? OR to_id = ?) UNION SELECT 1 FROM code_links WHERE project_id = ? AND status = 'confirmed' AND object_id = ?", projectId, id, id, projectId, id))
+                    throw new Error(`Object ${id} has confirmed links.`);
+            }
+            this.setStatus(projectId, rejected, 'rejected', { ...auth, note });
+            this.audit(projectId, 'review.reject', { ids: rejected, skipped, note, authorization: auth });
+            return { rejected, skipped };
+        });
+    }
+    setStatus(projectId, ids, status, decision) {
+        const at = now();
+        for (const id of ids) {
+            const table = tableOf(id);
+            this.run(`UPDATE ${table} SET status = ?, decision = ?, updated_at = ? WHERE project_id = ? AND id = ?`, status, JSON.stringify(decision), at, projectId, id);
+        }
+    }
+    /**
+     * Undo a batch: delete the candidates it created and the evidence it added.
+     * Refused when the batch touched anything already confirmed, or when later
+     * batches link to objects it created.
+     */
+    rollbackBatch(projectId, batchId) {
+        return this.tx(() => {
+            if (!this.get('SELECT 1 FROM batches WHERE project_id = ? AND id = ?', projectId, batchId))
+                throw new Error(`Unknown batch "${batchId}".`);
+            const touchedConfirmed = this.get(`SELECT 1 FROM evidence e LEFT JOIN objects o ON o.id = e.target_id LEFT JOIN links l ON l.id = e.target_id LEFT JOIN code_links c ON c.id = e.target_id
+        WHERE e.project_id = ? AND e.batch_id = ? AND (o.status = 'confirmed' OR l.status = 'confirmed' OR c.status = 'confirmed')`, projectId, batchId);
+            if (touchedConfirmed)
+                throw new Error('Batch added evidence to confirmed records; it cannot be rolled back.');
+            const created = this.all('SELECT id FROM objects WHERE project_id = ? AND batch_id = ?', projectId, batchId).map(r => String(r.id));
+            const foreign = this.get(`SELECT id FROM links WHERE project_id = ? AND batch_id != ? AND (from_id IN (SELECT id FROM objects WHERE batch_id = ?) OR to_id IN (SELECT id FROM objects WHERE batch_id = ?))
+        UNION SELECT id FROM code_links WHERE project_id = ? AND batch_id != ? AND object_id IN (SELECT id FROM objects WHERE batch_id = ?)`, projectId, batchId, batchId, batchId, projectId, batchId, batchId);
+            if (foreign)
+                throw new Error(`Link ${foreign.id} from another batch depends on objects created here; roll that batch back first.`);
+            if (this.get('SELECT 1 FROM entity_merges, json_each(entity_merges.batches) WHERE project_id = ? AND json_each.value = ?', projectId, batchId))
+                throw new Error('Records from this batch were merged with others; it can no longer be rolled back.');
+            if (this.get('SELECT 1 FROM conflicts WHERE project_id = ? AND batch_id = ? AND resolution IS NOT NULL', projectId, batchId))
+                throw new Error('A conflict raised by this batch was already resolved; it can no longer be rolled back.');
+            const borrowed = this.get(`SELECT batch_id FROM evidence WHERE project_id = ? AND batch_id != ? AND target_id IN (SELECT id FROM objects WHERE batch_id = ? UNION SELECT id FROM links WHERE batch_id = ? UNION SELECT id FROM code_links WHERE batch_id = ?)`, projectId, batchId, batchId, batchId, batchId);
+            if (borrowed)
+                throw new Error(`Batch ${borrowed.batch_id} also has evidence on records created here (for example after a merge); roll that batch back first.`);
+            const later = this.get(`SELECT e.batch_id FROM evidence e JOIN batches b ON b.id = e.batch_id WHERE e.project_id = ? AND e.batch_id != ? AND b.rowid > (SELECT rowid FROM batches WHERE id = ?)
+        AND e.target_id IN (SELECT target_id FROM evidence WHERE batch_id = ?)`, projectId, batchId, batchId, batchId);
+            if (later)
+                throw new Error(`Batch ${later.batch_id} later added to the same records; roll that batch back first.`);
+            for (const merge of this.all('SELECT object_id, before FROM merges WHERE batch_id = ?', batchId)) {
+                this.run('UPDATE objects SET properties = ?, updated_at = ? WHERE id = ?', String(merge.before), now(), String(merge.object_id));
+            }
+            this.run('DELETE FROM merges WHERE batch_id = ?', batchId);
+            this.run('DELETE FROM conflicts WHERE project_id = ? AND (batch_id = ? OR target_id IN (SELECT id FROM objects WHERE batch_id = ?))', projectId, batchId, batchId);
+            this.run('DELETE FROM aliases WHERE project_id = ? AND object_id IN (SELECT id FROM objects WHERE batch_id = ?)', projectId, batchId);
+            const evidence = Number(this.get('SELECT count(*) AS n FROM evidence WHERE project_id = ? AND batch_id = ?', projectId, batchId)?.n);
+            const links = Number(this.get('SELECT count(*) AS n FROM links WHERE project_id = ? AND batch_id = ?', projectId, batchId)?.n);
+            this.run('DELETE FROM evidence WHERE project_id = ? AND batch_id = ?', projectId, batchId);
+            this.run('DELETE FROM links WHERE project_id = ? AND batch_id = ?', projectId, batchId);
+            this.run('DELETE FROM code_links WHERE project_id = ? AND batch_id = ?', projectId, batchId);
+            this.run('DELETE FROM objects WHERE project_id = ? AND batch_id = ?', projectId, batchId);
+            this.audit(projectId, 'batch.rollback', { batchId, objects: created.length, links, evidence });
+            return { objects: created.length, links, evidence };
+        });
+    }
+    objects(projectId, filter = {}) {
+        const statuses = filter.status?.length ? filter.status : ['candidate', 'confirmed'];
+        const marks = statuses.map(() => '?').join(', ');
+        const rows = filter.type
+            ? this.all(`SELECT id, type, key, properties, status, batch_id FROM objects WHERE project_id = ? AND type = ? AND status IN (${marks}) ORDER BY rowid`, projectId, filter.type, ...statuses)
+            : this.all(`SELECT id, type, key, properties, status, batch_id FROM objects WHERE project_id = ? AND status IN (${marks}) ORDER BY rowid`, projectId, ...statuses);
+        return rows.map(r => ({ id: String(r.id), type: String(r.type), key: String(r.key), properties: JSON.parse(String(r.properties)), status: r.status, batchId: String(r.batch_id) }));
+    }
+    links(projectId, filter = {}) {
+        const statuses = filter.status?.length ? filter.status : ['candidate', 'confirmed'];
+        const marks = statuses.map(() => '?').join(', ');
+        const rows = filter.linkType
+            ? this.all(`SELECT id, link_type, from_id, to_id, status, batch_id FROM links WHERE project_id = ? AND link_type = ? AND status IN (${marks}) ORDER BY rowid`, projectId, filter.linkType, ...statuses)
+            : this.all(`SELECT id, link_type, from_id, to_id, status, batch_id FROM links WHERE project_id = ? AND status IN (${marks}) ORDER BY rowid`, projectId, ...statuses);
+        return rows.map(r => ({ id: String(r.id), linkType: String(r.link_type), fromId: String(r.from_id), toId: String(r.to_id), status: r.status, batchId: String(r.batch_id) }));
+    }
+    evidence(projectId, targetId) {
+        return this.all('SELECT * FROM evidence WHERE project_id = ? AND target_id = ? ORDER BY rowid', projectId, targetId).map(r => ({
+            id: String(r.id), targetId: String(r.target_id), field: r.field === null ? null : String(r.field), materialId: String(r.material_id),
+            start: Number(r.start_offset), end: Number(r.end_offset), line: Number(r.line), quote: String(r.quote), match: String(r.match), role: r.role, batchId: String(r.batch_id)
+        }));
+    }
+    /** Every evidence span cited from one material with its target's status, for reading the material with extractions highlighted. */
+    materialEvidence(projectId, materialId) {
+        return this.all(`SELECT e.*, COALESCE(o.status, l.status, c.status, 'candidate') AS status FROM evidence e
+      LEFT JOIN objects o ON o.id = e.target_id LEFT JOIN links l ON l.id = e.target_id LEFT JOIN code_links c ON c.id = e.target_id
+      WHERE e.project_id = ? AND e.material_id = ? ORDER BY e.start_offset, e.rowid`, projectId, materialId).map(r => ({
+            id: String(r.id), targetId: String(r.target_id), field: r.field === null ? null : String(r.field), materialId: String(r.material_id),
+            start: Number(r.start_offset), end: Number(r.end_offset), line: Number(r.line), quote: String(r.quote), match: String(r.match), role: r.role, batchId: String(r.batch_id),
+            status: r.status
+        }));
+    }
+    /** Published schema versions, oldest first. */
+    schemaVersions(projectId) {
+        return this.all('SELECT version, schema, hash, note, created_at FROM schema_versions WHERE project_id = ? ORDER BY version', projectId)
+            .map(row => ({ version: Number(row.version), schema: JSON.parse(String(row.schema)), hash: String(row.hash), note: String(row.note), createdAt: String(row.created_at) }));
+    }
+    auditLog(projectId, limit = 50) {
+        return this.all('SELECT seq, at, action, detail FROM audit WHERE project_id = ? ORDER BY seq DESC LIMIT ?', projectId, limit)
+            .map(r => ({ seq: Number(r.seq), at: String(r.at), action: String(r.action), detail: JSON.parse(String(r.detail)) }));
+    }
+}
+function tally(items) {
+    return { created: items.filter(i => i.outcome === 'created').length, merged: items.filter(i => i.outcome === 'merged').length, failed: items.filter(i => i.outcome === 'failed').length };
+}
+function toProject(row) {
+    return { id: String(row.id), name: String(row.name), description: String(row.description), createdAt: String(row.created_at) };
+}
