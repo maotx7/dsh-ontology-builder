@@ -3,8 +3,8 @@
 export type Status = 'candidate' | 'confirmed' | 'rejected'
 export interface Issue { severity: 'blocking' | 'warning' | 'hint'; code: string; path: string; message: string }
 export interface Project { id: string; name: string; description: string; createdAt: string }
-export interface PropertyDef { apiName: string; displayName?: string; type: string; required?: boolean; enum?: string[] }
-export interface ObjectTypeDef { apiName: string; displayName?: string; description?: string; primaryKey: string; titleProperty?: string; properties: PropertyDef[] }
+export interface PropertyDef { apiName: string; displayName?: string; description?: string; type: string; required?: boolean; enum?: string[]; pattern?: string }
+export interface ObjectTypeDef { apiName: string; displayName?: string; description?: string; primaryKey: string; titleProperty?: string; properties: PropertyDef[]; questions?: string[] }
 export interface LinkTypeDef { apiName: string; inverseApiName: string; from: string; to: string; cardinality: string; description?: string }
 export interface OntologySchema { questions: Array<{ id: string; text: string; priority: string }>; objectTypes: ObjectTypeDef[]; linkTypes: LinkTypeDef[] }
 export interface ObjectRecord { id: string; type: string; key: string; properties: Record<string, unknown>; status: Status; batchId: string }

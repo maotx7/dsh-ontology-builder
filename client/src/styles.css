@@ -58,8 +58,12 @@ main { padding: 12px 16px; }
 .type-title { padding: 6px 8px; border-bottom: 1px solid var(--border); background: #f1f3f8; border-radius: 6px 6px 0 0; }
 .type-props { list-style: none; margin: 0; padding: 4px 8px; }
 .type-props li { display: flex; justify-content: space-between; line-height: 20px; }
+.react-flow__node-objectType { cursor: grab; }
+.react-flow__node-objectType.dragging { cursor: grabbing; }
+.react-flow__node.selected .type-card { box-shadow: 0 0 0 3px var(--accent); }
 .react-flow__edge.diff-added path { stroke: var(--ok); stroke-width: 2; }
 .react-flow__edge.diff-changed path { stroke: var(--warn); stroke-dasharray: 5 4; }
+.react-flow__edge.related path { stroke: var(--accent); stroke-width: 2.5; }
 .legend .diff-added { color: var(--ok); }
 .legend .diff-changed { color: var(--warn); }
 li.diff-added { color: var(--ok); }
@@ -68,6 +72,10 @@ li.diff-changed { color: var(--warn); }
 
 .panel h2 { font-size: 15px; margin: 0 0 4px; word-break: break-all; }
 .panel h3 { font-size: 13px; margin: 14px 0 4px; }
+.panel-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+.type-links { padding-left: 18px; margin: 4px 0; }
+.type-links li { margin: 4px 0; }
+.enum-values code { margin-right: 4px; padding: 0 3px; background: #f1f3f8; border-radius: 3px; }
 .props { border-collapse: collapse; width: 100%; }
 .props th, .props td { text-align: left; border-bottom: 1px solid #eee; padding: 3px 6px; vertical-align: top; word-break: break-word; }
 .props th { width: 35%; color: var(--muted); font-weight: normal; }

@@ -1,0 +1,82 @@
+{
+  "questions": [
+    { "id": "q_owner", "text": "每个服务由哪个团队负责？", "priority": "must" },
+    { "id": "q_tier1", "text": "有哪些一级服务？", "priority": "should" },
+    { "id": "q_deps", "text": "一个服务依赖哪些其他服务？", "priority": "should" }
+  ],
+  "objectTypes": [
+    {
+      "apiName": "Team",
+      "displayName": "团队",
+      "description": "开发团队或业务单元",
+      "primaryKey": "name",
+      "titleProperty": "name",
+      "questions": ["q_owner"],
+      "properties": [
+        {
+          "apiName": "name",
+          "displayName": "团队名称",
+          "description": "团队的唯一标识符",
+          "type": "string",
+          "required": true
+        },
+        {
+          "apiName": "department",
+          "displayName": "所属部门",
+          "description": "团队所属的部门",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "apiName": "Service",
+      "displayName": "服务",
+      "description": "微服务或应用系统",
+      "primaryKey": "name",
+      "titleProperty": "name",
+      "questions": ["q_owner", "q_tier1", "q_deps"],
+      "properties": [
+        {
+          "apiName": "name",
+          "displayName": "服务名称",
+          "description": "服务的唯一标识符",
+          "type": "string",
+          "required": true
+        },
+        {
+          "apiName": "tier",
+          "displayName": "服务等级",
+          "description": "服务的重要性等级（1=最高）",
+          "type": "integer"
+        },
+        {
+          "apiName": "status",
+          "displayName": "服务状态",
+          "description": "服务的运行状态",
+          "type": "string",
+          "enum": ["active", "deprecated", "planned"]
+        }
+      ]
+    }
+  ],
+  "linkTypes": [
+    {
+      "apiName": "owner",
+      "inverseApiName": "services",
+      "from": "Service",
+      "to": "Team",
+      "cardinality": "many-to-one",
+      "description": "服务的负责团队",
+      "questions": ["q_owner"]
+    },
+    {
+      "apiName": "dependsOn",
+      "inverseApiName": "dependents",
+      "from": "Service",
+      "to": "Service",
+      "cardinality": "many-to-many",
+      "description": "服务之间的依赖关系",
+      "questions": ["q_deps"]
+    }
+  ]
+}
