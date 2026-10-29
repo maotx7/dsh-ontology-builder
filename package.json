@@ -56,6 +56,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && vite build --config client/vite.config.ts",
+    "prepublishOnly": "npm run build",
     "build:server": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p client/tsconfig.json",
     "dev:ui": "vite --config client/vite.config.ts",

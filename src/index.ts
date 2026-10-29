@@ -100,7 +100,12 @@ export function apply(ctx: Context, config: Config) {
       const base = uiUrl()
       if (!base) return { available: false, hint: 'The UI needs the DSH web surface. Start DSH with `dsh --profile web` (with this plugin installed in that profile) and ask again.' }
       const project = (args as { project?: string }).project
-      return { available: true, url: project ? `${base}?project=${encodeURIComponent(project)}` : base, note: 'Open it in the browser where the DSH web GUI is already signed in.' }
+      return {
+        available: true,
+        url: project ? `${base}?project=${encodeURIComponent(project)}` : base,
+        hint: `💡 Open in your browser: ${project ? `${base}?project=${encodeURIComponent(project)}` : base}`,
+        note: 'Open it in the browser where the DSH web GUI is already signed in. Without a project parameter, the UI will show the first available project.'
+      }
     }
   }))
   const model = createModel(services.llm, () => services.agentDefaultModel.currentSelection(), config.extraction.maxTokens)
