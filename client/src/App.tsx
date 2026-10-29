@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { type Overview, type Project } from './api'
 import { RevisionContext, useApi, useRevision } from './hooks'
-import { Loading } from './ui'
+import { LangProvider, useLang, useT } from './i18n'
+import { Loading, WithCode } from './ui'
 import { SchemaView } from './views/SchemaView'
 import { ExploreView } from './views/ExploreView'
 import { ReviewView } from './views/ReviewView'
@@ -10,7 +11,6 @@ import { QualityView } from './views/QualityView'
 
 const TABS = ['schema', 'explore', 'review', 'materials', 'quality'] as const
 export type Tab = typeof TABS[number]
-const LABELS: Record<Tab, string> = { schema: 'Schema', explore: 'Instances', review: 'Review', materials: 'Materials', quality: 'Quality & versions' }
 
 /** Where to jump: a tab plus an optional item or material focus. */
 export interface Nav { tab: Tab; item?: string; material?: string; evidence?: string }
@@ -23,6 +23,14 @@ function readUrl(): { project?: string } & Nav {
 }
 
 export function App() {
+  return (
+    <LangProvider>
+      <AppBody />
+    </LangProvider>
+  )
+}
+
+function AppBody() {
   const initial = readUrl()
   const projects = useApi<Project[]>('projects', {})
   const [project, setProject] = useState<string | undefined>(initial.project)
@@ -51,39 +59,54 @@ export function App() {
     return () => removeEventListener('popstate', onPop)
   }, [])
 
+  const t = useT()
   return (
     <RevisionContext.Provider value={revision}>
       <header className="top">
-        <h1>Ontology Builder</h1>
+        <h1>{t('title')}</h1>
         <label>
-          <span className="sr-only">Project</span>
+          <span className="sr-only">{t('project')}</span>
           <select value={project ?? ''} onChange={e => { setProject(e.target.value); setNav({ tab: nav.tab }) }}>
             {projects.data?.map(p => <option key={p.id} value={p.name}>{p.name}</option>)}
           </select>
         </label>
-        <nav aria-label="Views">
-          {TABS.map(t => (
-            <button key={t} type="button" aria-current={nav.tab === t ? 'page' : undefined} onClick={() => setNav({ tab: t })}>{LABELS[t]}</button>
+        <nav aria-label={t('viewsNavLabel')}>
+          {TABS.map(tab => (
+            <button key={tab} type="button" aria-current={nav.tab === tab ? 'page' : undefined} onClick={() => setNav({ tab })}>{t.tab[tab]}</button>
           ))}
         </nav>
         {project && <Summary project={project} />}
+        <LangToggle />
       </header>
       <main>
         <Loading {...projects} loading={projects.loading && !projects.data} />
-        {projects.data && !projects.data.length && <p className="empty">No projects yet. In DSH chat, ask the agent to create one with <code>ontology_project</code>.</p>}
+        {projects.data && !projects.data.length && <p className="empty"><WithCode text={t('noProjects')} /></p>}
         {project && <Body key={project} project={project} nav={nav} navigate={setNav} />}
       </main>
     </RevisionContext.Provider>
   )
 }
 
+function LangToggle() {
+  const [lang, setLang] = useLang()
+  return (
+    <button type="button" className="lang-toggle" onClick={() => setLang(lang === 'en' ? 'zh' : 'en')} aria-label="Switch language / 切换语言">
+      {lang === 'en' ? '中文' : 'EN'}
+    </button>
+  )
+}
+
 function Summary({ project }: { project: string }) {
+  const t = useT()
   const { data } = useApi<Overview>('overview', { project })
   if (!data) return null
   const v = data.versions.at(-1)
   return (
     <p className="summary" aria-live="polite">
-      {v ? `schema v${v.version}` : 'schema not published'} · {data.objects.confirmed} confirmed / {data.objects.candidate} candidate objects · {data.links.confirmed} / {data.links.candidate} links · {data.materials} materials
+      {v ? `schema v${v.version}` : t('schemaNotPublished')} · {t('summary', {
+        confirmed: data.objects.confirmed, candidate: data.objects.candidate,
+        linksConfirmed: data.links.confirmed, linksCandidate: data.links.candidate, materials: data.materials
+      })}
     </p>
   )
 }

@@ -5,7 +5,8 @@ import { Background, BaseEdge, Controls, type Edge, type EdgeProps, Handle, Mark
 import '@xyflow/react/dist/style.css'
 import type { ObjectTypeDef, OntologySchema, Overview } from '../api'
 import { useApi } from '../hooks'
-import { Loading } from '../ui'
+import { useT } from '../i18n'
+import { Loading, WithCode } from '../ui'
 
 const CARD_WIDTH = 240
 const ROW_HEIGHT = 20
@@ -14,6 +15,7 @@ const CARD_BASE = 56
 type TypeNode = Node<{ type: ObjectTypeDef; changed: 'added' | 'changed' | null }, 'objectType'>
 
 function TypeCard({ data }: NodeProps<TypeNode>) {
+  const tr = useT()
   const t = data.type
   return (
     <div className={`type-card${data.changed ? ` diff-${data.changed}` : ''}`}>
@@ -21,13 +23,13 @@ function TypeCard({ data }: NodeProps<TypeNode>) {
       <div className="type-title">
         <strong>{t.displayName ?? t.apiName}</strong>
         {t.displayName && t.displayName !== t.apiName && <span className="muted"> {t.apiName}</span>}
-        {data.changed && <span className="badge">{data.changed}</span>}
+        {data.changed && <span className="badge">{tr(data.changed)}</span>}
       </div>
       <ul className="type-props">
         {t.properties.map(p => (
           <li key={p.apiName}>
             <span>{p.apiName === t.primaryKey ? '🔑 ' : ''}{p.apiName}{p.required ? '*' : ''}</span>
-            <span className="muted">{p.enum ? 'enum' : p.type}</span>
+            <span className="muted">{p.enum ? tr('enum') : p.type}</span>
           </li>
         ))}
       </ul>
@@ -78,6 +80,7 @@ function layout(schema: OntologySchema, diff: { added: Set<string>; changed: Set
 }
 
 export function SchemaView({ project }: { project: string }) {
+  const t = useT()
   const overview = useApi<Overview>('overview', { project })
   const [version, setVersion] = useState('draft')
   const { data, error, loading } = useApi<{ version: number | 'draft'; schema: OntologySchema }>('schema', { project, version })
@@ -102,19 +105,19 @@ export function SchemaView({ project }: { project: string }) {
     <div className="view">
       <div className="toolbar">
         <label>
-          Version{' '}
+          {t('version')}{' '}
           <select value={version} onChange={e => setVersion(e.target.value)}>
-            <option value="draft">draft</option>
+            <option value="draft">{t('draft')}</option>
             {overview.data?.versions.slice().reverse().map(v => <option key={v.version} value={String(v.version)}>v{v.version} {v.note && `— ${v.note}`}</option>)}
           </select>
         </label>
-        {data && <span className="muted">{data.schema.objectTypes.length} object types · {data.schema.linkTypes.length} link types · {data.schema.questions.length} competency questions</span>}
-        {version === 'draft' && latest && <span className="legend"><span className="diff-added">added</span> <span className="diff-changed">changed</span> vs v{latest}</span>}
+        {data && <span className="muted">{t('objectTypesCount', { objects: data.schema.objectTypes.length, links: data.schema.linkTypes.length, questions: data.schema.questions.length })}</span>}
+        {version === 'draft' && latest && <span className="legend"><span className="diff-added">{t('added')}</span> <span className="diff-changed">{t('changed')}</span> {t('vs', { version: latest })}</span>}
       </div>
       <Loading error={error} loading={loading && !data} />
-      {data && !data.schema.objectTypes.length && <p className="empty">The schema is empty. Ask the agent to draft one with <code>ontology_schema</code>.</p>}
+      {data && !data.schema.objectTypes.length && <p className="empty"><WithCode text={t('schemaEmpty')} /></p>}
       {graph && graph.nodes.length > 0 && (
-        <div className="canvas" role="img" aria-label="Schema diagram: object types and the link types between them">
+        <div className="canvas" role="img" aria-label={t('schemaDiagramLabel')}>
           <ReactFlow nodes={graph.nodes} edges={graph.edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView fitViewOptions={{ padding: 0.3 }} nodesConnectable={false} edgesFocusable={false} minZoom={0.1}>
             <Background />
             <Controls showInteractive={false} />
@@ -123,7 +126,7 @@ export function SchemaView({ project }: { project: string }) {
       )}
       {data && data.schema.questions.length > 0 && (
         <details>
-          <summary>Competency questions</summary>
+          <summary>{t('competencyQuestions')}</summary>
           <ul>{data.schema.questions.map(q => <li key={q.id}><code>{q.id}</code> [{q.priority}] {q.text}</li>)}</ul>
         </details>
       )}

@@ -2,10 +2,12 @@
 import type { ItemDetail } from '../api'
 import type { Navigate } from '../App'
 import { useApi } from '../hooks'
+import { useT } from '../i18n'
 import { AskButton, Issues, Loading, StatusBadge, formatValue } from '../ui'
 import type { Issue } from '../api'
 
 export function ItemPanel({ project, id, issues = [], navigate }: { project: string; id: string; issues?: Issue[]; navigate: Navigate }) {
+  const t = useT()
   const { data, error, loading } = useApi<ItemDetail>('item', { project, id })
   if (!data) return <Loading error={error} loading={loading} />
   const r = data.record
@@ -15,9 +17,9 @@ export function ItemPanel({ project, id, issues = [], navigate }: { project: str
   }
   const title = 'key' in r ? `${r.type} · ${r.key}` : 'linkType' in r ? `${r.linkType}: ${name(r.fromId)} → ${name(r.toId)}` : `${r.relation}: ${name(r.objectId)} → ${r.codeRef}`
   return (
-    <section className="panel" aria-label="Item details">
+    <section className="panel" aria-label={t('itemDetailsLabel')}>
       <h2>{title} <StatusBadge status={r.status} /></h2>
-      <p className="muted"><code>{r.id}</code> · batch <code>{r.batchId}</code></p>
+      <p className="muted"><code>{r.id}</code> · {t('batch')} <code>{r.batchId}</code></p>
       {data.endpoints.length > 0 && (
         <p>
           {data.endpoints.map(o => (
@@ -33,17 +35,17 @@ export function ItemPanel({ project, id, issues = [], navigate }: { project: str
           </tbody>
         </table>
       )}
-      {'stale' in r && r.stale && <p className="error">The code element no longer exists in the latest snapshot.</p>}
+      {'stale' in r && r.stale && <p className="error">{t('codeNoLongerExists')}</p>}
 
-      <h3>Evidence ({data.evidence.length})</h3>
-      {!data.evidence.length && <p className="muted">No evidence.</p>}
+      <h3>{t('evidenceCount', { count: data.evidence.length })}</h3>
+      {!data.evidence.length && <p className="muted">{t('noEvidence')}</p>}
       <ul className="evidence">
         {data.evidence.map(e => (
           <li key={e.id}>
             <blockquote>{e.quote}</blockquote>
             <p className="muted">
-              {e.field ?? 'record'} · <span className={`role role-${e.role}`}>{e.role}</span> · line {e.line} · match {e.match}{' '}
-              <button type="button" className="link" onClick={() => navigate({ tab: 'materials', material: e.materialId, evidence: e.id })}>Open in material</button>
+              {e.field ?? t('record')} · <span className={`role role-${e.role}`}>{e.role}</span> · line {e.line} · match {e.match}{' '}
+              <button type="button" className="link" onClick={() => navigate({ tab: 'materials', material: e.materialId, evidence: e.id })}>{t('openInMaterial')}</button>
             </p>
           </li>
         ))}
@@ -51,12 +53,12 @@ export function ItemPanel({ project, id, issues = [], navigate }: { project: str
 
       {data.conflicts.length > 0 && (
         <>
-          <h3>Open conflicts</h3>
+          <h3>{t('openConflicts')}</h3>
           <ul>
             {data.conflicts.map(c => (
               <li key={c.id}>
-                <code>{c.field}</code>: kept <strong>{formatValue(c.kept)}</strong>, other source says <strong>{formatValue(c.other)}</strong>{' '}
-                <AskButton label="Ask to resolve" text={`Resolve ontology conflict ${c.id} in project ${project} (field ${c.field}: kept ${formatValue(c.kept)} vs ${formatValue(c.other)}).`} />
+                <code>{c.field}</code>: {t('kept')} <strong>{formatValue(c.kept)}</strong>, {t('otherSourceSays')} <strong>{formatValue(c.other)}</strong>{' '}
+                <AskButton label={t('askToResolve')} text={`Resolve ontology conflict ${c.id} in project ${project} (field ${c.field}: kept ${formatValue(c.kept)} vs ${formatValue(c.other)}).`} />
               </li>
             ))}
           </ul>
@@ -65,18 +67,18 @@ export function ItemPanel({ project, id, issues = [], navigate }: { project: str
 
       {data.codeLinks.length > 0 && (
         <>
-          <h3>Code</h3>
+          <h3>{t('code')}</h3>
           <ul>
-            {data.codeLinks.map(c => <li key={c.id}>{c.relation} <code>{c.codeRef}</code> <StatusBadge status={c.status} />{c.stale && <span className="error"> stale</span>}</li>)}
+            {data.codeLinks.map(c => <li key={c.id}>{c.relation} <code>{c.codeRef}</code> <StatusBadge status={c.status} />{c.stale && <span className="error"> {t('stale')}</span>}</li>)}
           </ul>
         </>
       )}
-      {data.code && <p>Code element: <code>{data.code.ref}</code> ({data.code.kind}) in {data.code.module}, line {data.code.line}</p>}
+      {data.code && <p>{t('codeElement', { ref: data.code.ref, kind: data.code.kind, module: data.code.module, line: data.code.line })}</p>}
 
       <div className="actions">
-        {r.status === 'candidate' && <AskButton label="Ask to confirm" text={`Preview and confirm ${r.id} in ontology project ${project}.`} />}
-        {r.status === 'candidate' && <AskButton label="Ask to reject" text={`Reject ${r.id} in ontology project ${project}. Reason: `} />}
-        {'key' in r && <button type="button" onClick={() => navigate({ tab: 'explore', item: r.id })}>Show in graph</button>}
+        {r.status === 'candidate' && <AskButton label={t('askToConfirm')} text={`Preview and confirm ${r.id} in ontology project ${project}.`} />}
+        {r.status === 'candidate' && <AskButton label={t('askToReject')} text={`Reject ${r.id} in ontology project ${project}. ${t('reasonPrefix')}`} />}
+        {'key' in r && <button type="button" onClick={() => navigate({ tab: 'explore', item: r.id })}>{t('showInGraph')}</button>}
       </div>
     </section>
   )

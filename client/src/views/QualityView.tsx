@@ -2,21 +2,26 @@
 import { useState } from 'react'
 import type { Issue, Overview, Quality, SchemaDiff } from '../api'
 import { useApi } from '../hooks'
+import { useT } from '../i18n'
 import { Issues, Loading } from '../ui'
 
 const pct = (v: number | null) => (v === null ? '—' : `${(v * 100).toFixed(0)}%`)
+const QUESTION_STATUS_KEY = { pass: 'questionPass', fail: 'questionFail', error: 'questionError', 'no-query': 'questionNoQuery' } as const
+const DIFF_KEY = { added: 'diffAdded', removed: 'diffRemoved', changed: 'diffChanged' } as const
 
 function Layer({ title, issues }: { title: string; issues: Issue[] }) {
+  const t = useT()
   const blocking = issues.filter(i => i.severity === 'blocking').length
   return (
     <details open={blocking > 0}>
-      <summary>{title}: {issues.length ? `${issues.length} issue(s)${blocking ? `, ${blocking} blocking` : ''}` : 'no issues'}</summary>
+      <summary>{title}: {issues.length ? t('issuesCount', { count: issues.length }) + (blocking ? t('blockingSuffix', { count: blocking }) : '') : t('noIssues')}</summary>
       <Issues issues={issues} />
     </details>
   )
 }
 
 export function QualityView({ project }: { project: string }) {
+  const t = useT()
   const q = useApi<Quality>('quality', { project })
   const overview = useApi<Overview>('overview', { project })
   const versions = overview.data?.versions ?? []
@@ -28,53 +33,53 @@ export function QualityView({ project }: { project: string }) {
   return (
     <div className="view columns">
       <section>
-        <h2>Quality</h2>
+        <h2>{t('quality')}</h2>
         <Loading error={q.error} loading={q.loading && !q.data} />
         {q.data && (
           <>
             <p className={q.data.summary.ready ? 'ok' : 'sev-blocking'}>
-              {q.data.summary.ready ? 'Ready' : 'Not ready'} · schema v{q.data.schemaVersion} · {q.data.summary.blocking} blocking, {q.data.summary.warnings} warnings, {q.data.summary.hints} hints
+              {q.data.summary.ready ? t('statusReady') : t('statusNotReady')} · schema v{q.data.schemaVersion} · {t('issuesSummary', { blocking: q.data.summary.blocking, warnings: q.data.summary.warnings, hints: q.data.summary.hints })}
             </p>
-            <Layer title="1 Structure" issues={q.data.structure} />
-            <Layer title="2 Logic" issues={q.data.logic} />
-            <Layer title="3 Evidence" issues={q.data.evidence} />
-            <Layer title="4 Smells" issues={q.data.smells} />
-            <h3>5 Competency questions — must {q.data.questions.mustAnswered}/{q.data.questions.mustTotal}</h3>
+            <Layer title={t('layerStructure')} issues={q.data.structure} />
+            <Layer title={t('layerLogic')} issues={q.data.logic} />
+            <Layer title={t('layerEvidence')} issues={q.data.evidence} />
+            <Layer title={t('layerSmells')} issues={q.data.smells} />
+            <h3>{t('questionsLayer', { answered: q.data.questions.mustAnswered, total: q.data.questions.mustTotal })}</h3>
             <table>
-              <thead><tr><th scope="col">Question</th><th scope="col">Priority</th><th scope="col">Result</th></tr></thead>
+              <thead><tr><th scope="col">{t('question')}</th><th scope="col">{t('priority')}</th><th scope="col">{t('result')}</th></tr></thead>
               <tbody>
                 {q.data.questions.results.map(r => (
                   <tr key={r.questionId}>
                     <td>{r.text}</td>
                     <td>{r.priority}</td>
                     <td className={r.status === 'pass' ? 'ok' : 'sev-blocking'}>
-                      {r.status}{r.total !== undefined && ` (${r.total})`}{r.regression && ' · regression'}{r.missing?.length ? ` · missing ${r.missing.join(', ')}` : ''}{r.error && ` · ${r.error}`}
+                      {t(QUESTION_STATUS_KEY[r.status as keyof typeof QUESTION_STATUS_KEY])}{r.total !== undefined && ` (${r.total})`}{r.regression && ` · ${t('regression')}`}{r.missing?.length ? ` · ${t('missing', { list: r.missing.join(', ') })}` : ''}{r.error && ` · ${r.error}`}
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
             <Issues issues={q.data.questions.issues} />
-            <h3>6 Extraction</h3>
+            <h3>{t('extractionLayer')}</h3>
             <ul>
-              <li>{q.data.extraction.confirmed} confirmed, {q.data.extraction.candidates} candidates, {q.data.extraction.rejected} rejected</li>
-              <li>Review acceptance {pct(q.data.extraction.reviewAcceptance)} · dropped by validation {q.data.extraction.droppedByValidation}</li>
-              <li>Code links: {q.data.extraction.codeLinks.confirmed} confirmed, {q.data.extraction.codeLinks.candidate} candidates, {q.data.extraction.codeLinks.stale} stale</li>
-              {q.data.extraction.rules.map(r => <li key={r.id}>Rule {r.name}: {r.status}, {r.confirmed} confirmed, accuracy {pct(r.accuracy)} over {r.judged} checks</li>)}
+              <li>{t('extractionSummary', { confirmed: q.data.extraction.confirmed, candidates: q.data.extraction.candidates, rejected: q.data.extraction.rejected })}</li>
+              <li>{t('reviewAcceptance', { pct: pct(q.data.extraction.reviewAcceptance), dropped: q.data.extraction.droppedByValidation })}</li>
+              <li>{t('codeLinksSummary', { confirmed: q.data.extraction.codeLinks.confirmed, candidate: q.data.extraction.codeLinks.candidate, stale: q.data.extraction.codeLinks.stale })}</li>
+              {q.data.extraction.rules.map(r => <li key={r.id}>{t('ruleSummary', { name: r.name, status: r.status, confirmed: r.confirmed, judged: r.judged, accuracy: pct(r.accuracy) })}</li>)}
             </ul>
             <p className="muted">{q.data.method}</p>
           </>
         )}
       </section>
       <section>
-        <h2>Versions</h2>
+        <h2>{t('versions')}</h2>
         <div className="toolbar">
-          <label>From <select value={from} onChange={e => setFrom(e.target.value)}>
-            <option value="">latest published</option>
+          <label>{t('from')} <select value={from} onChange={e => setFrom(e.target.value)}>
+            <option value="">{t('latestPublished')}</option>
             {versions.map(v => <option key={v.version} value={String(v.version)}>v{v.version}</option>)}
           </select></label>
-          <label>To <select value={to} onChange={e => setTo(e.target.value)}>
-            <option value="draft">draft</option>
+          <label>{t('to')} <select value={to} onChange={e => setTo(e.target.value)}>
+            <option value="draft">{t('draft')}</option>
             {versions.map(v => <option key={v.version} value={String(v.version)}>v{v.version}</option>)}
           </select></label>
         </div>
@@ -83,7 +88,7 @@ export function QualityView({ project }: { project: string }) {
             <p>{diff.data.summary}</p>
             {(['objectTypes', 'linkTypes'] as const).map(k => (
               <ul key={k}>
-                {(['added', 'removed', 'changed'] as const).flatMap(c => diff.data![k][c].map(n => <li key={k + c + n} className={`diff-${c}`}>{c} {k === 'objectTypes' ? 'type' : 'link'} <code>{n}</code></li>))}
+                {(['added', 'removed', 'changed'] as const).flatMap(c => diff.data![k][c].map(n => <li key={k + c + n} className={`diff-${c}`}>{t(DIFF_KEY[c])} {k === 'objectTypes' ? t('typeWord') : t('linkWord')} <code>{n}</code></li>))}
               </ul>
             ))}
           </>
@@ -91,13 +96,13 @@ export function QualityView({ project }: { project: string }) {
         <ol className="versions">
           {versions.slice().reverse().map(v => <li key={v.version}>v{v.version} · {new Date(v.createdAt).toLocaleString()} · <code>{v.hash.slice(0, 12)}</code> {v.note}</li>)}
         </ol>
-        <h2>Audit log</h2>
+        <h2>{t('auditLog')}</h2>
         <Loading error={audit.error} loading={audit.loading && !audit.data} />
         <ol className="audit">
           {audit.data?.map(a => (
             <li key={a.seq}>
               <span className="muted">{new Date(a.at).toLocaleString()}</span> <code>{a.action}</code>
-              <details><summary className="muted">detail</summary><pre>{JSON.stringify(a.detail, null, 2)}</pre></details>
+              <details><summary className="muted">{t('detail')}</summary><pre>{JSON.stringify(a.detail, null, 2)}</pre></details>
             </li>
           ))}
         </ol>

@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef } from 'react'
 import type { Evidence, Material, MaterialSummary } from '../api'
 import type { Navigate } from '../App'
 import { useApi } from '../hooks'
+import { useT } from '../i18n'
 import { Loading } from '../ui'
 
 /** Cut the text into plain runs and highlighted runs; overlapping spans join the run that starts first. */
@@ -27,6 +28,7 @@ function segments(text: string, evidence: Evidence[]) {
 }
 
 export function MaterialView({ project, materialId, evidenceId, navigate }: { project: string; materialId?: string; evidenceId?: string; navigate: Navigate }) {
+  const t = useT()
   const list = useApi<MaterialSummary[]>('materials', { project })
   const { data, error, loading } = useApi<{ material: Material; evidence: Evidence[] }>(materialId ? 'material' : undefined, { project, id: materialId })
   const parts = useMemo(() => (data ? segments(data.material.text, data.evidence) : []), [data])
@@ -40,7 +42,7 @@ export function MaterialView({ project, materialId, evidenceId, navigate }: { pr
   return (
     <div className="view split">
       <aside className="side-col narrow">
-        <h2>Materials</h2>
+        <h2>{t('materials')}</h2>
         <Loading {...list} loading={list.loading && !list.data} />
         <ul className="material-list">
           {list.data?.map(m => (
@@ -52,12 +54,12 @@ export function MaterialView({ project, materialId, evidenceId, navigate }: { pr
         </ul>
       </aside>
       <div className="main-col">
-        {!materialId && <p className="muted">Choose a material.</p>}
+        {!materialId && <p className="muted">{t('chooseMaterial')}</p>}
         {materialId && <Loading error={error} loading={loading && !data} />}
         {data && (
           <>
             <h2>{data.material.name}</h2>
-            <p className="muted">sha256 <code>{data.material.sha256.slice(0, 16)}…</code> · {data.evidence.length} cited spans · read-only original</p>
+            <p className="muted">sha256 <code>{data.material.sha256.slice(0, 16)}…</code> · {t('citedSpans', { count: data.evidence.length })}</p>
             <pre className="material-text">
               {parts.map((p, n) => p.spans.length
                 ? (
@@ -66,7 +68,7 @@ export function MaterialView({ project, materialId, evidenceId, navigate }: { pr
                       ref={p.spans.some(s => s.id === evidenceId) ? focusRef : undefined}
                       tabIndex={0}
                       className={`${p.spans.every(s => s.status === 'confirmed') ? 'confirmed' : 'candidate'}${p.spans.some(s => s.id === evidenceId) ? ' focus' : ''}`}
-                      title={p.spans.map(s => `${s.targetId} · ${s.field ?? 'record'} · ${s.role} · ${s.status}`).join('\n')}
+                      title={p.spans.map(s => `${s.targetId} · ${s.field ?? t('record')} · ${s.role} · ${s.status}`).join('\n')}
                       onClick={() => navigate({ tab: 'review', item: p.spans[0].targetId })}
                       onKeyDown={e => e.key === 'Enter' && navigate({ tab: 'review', item: p.spans[0].targetId })}
                     >{p.text}</mark>

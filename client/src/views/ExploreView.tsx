@@ -7,6 +7,7 @@ import cytoscape, { type Core, type ElementDefinition } from 'cytoscape'
 import { api, type LinkRecord, type ObjectRecord, type OntologySchema, type Status } from '../api'
 import type { Navigate } from '../App'
 import { useApi } from '../hooks'
+import { useT } from '../i18n'
 import { Loading } from '../ui'
 import { ItemPanel } from './ItemPanel'
 
@@ -28,6 +29,7 @@ function toElements(objects: ObjectRecord[], links: LinkRecord[], color: (type: 
 }
 
 export function ExploreView({ project, focus, navigate }: { project: string; focus?: string; navigate: Navigate }) {
+  const tr = useT()
   const schema = useApi<{ schema: OntologySchema }>('schema', { project, version: 'draft' })
   const [type, setType] = useState('')
   const [showCandidates, setShowCandidates] = useState(true)
@@ -119,26 +121,26 @@ export function ExploreView({ project, focus, navigate }: { project: string; foc
     api<ObjectRecord[]>('search', { project, q: query, type: type || undefined, status }).then(setResults).catch((er: Error) => setError(er.message))
   }
 
-  const legend: Array<[string, Status]> = [['confirmed', 'confirmed'], ['candidate (dashed)', 'candidate']]
+  const legend: Array<[string, Status]> = [[tr('confirmed'), 'confirmed'], [tr('candidateDashed'), 'candidate']]
   return (
     <div className="view split">
       <div className="main-col">
         <div className="toolbar">
           <label>
-            Type{' '}
+            {tr('type')}{' '}
             <select value={type} onChange={e => { setType(e.target.value); loadType(e.target.value) }}>
-              <option value="">all</option>
-              {types.map(t => <option key={t.apiName} value={t.apiName}>{t.displayName ?? t.apiName}</option>)}
+              <option value="">{tr('all')}</option>
+              {types.map(ot => <option key={ot.apiName} value={ot.apiName}>{ot.displayName ?? ot.apiName}</option>)}
             </select>
           </label>
-          <label><input type="checkbox" checked={showCandidates} onChange={e => setShowCandidates(e.target.checked)} /> show candidates</label>
+          <label><input type="checkbox" checked={showCandidates} onChange={e => setShowCandidates(e.target.checked)} /> {tr('showCandidates')}</label>
           <form onSubmit={search} role="search">
-            <label className="sr-only" htmlFor="explore-search">Search objects</label>
-            <input id="explore-search" value={query} onChange={e => setQuery(e.target.value)} placeholder="Search key or property" />
-            <button type="submit">Search</button>
+            <label className="sr-only" htmlFor="explore-search">{tr('searchObjectsLabel')}</label>
+            <input id="explore-search" value={query} onChange={e => setQuery(e.target.value)} placeholder={tr('searchPlaceholder')} />
+            <button type="submit">{tr('search')}</button>
           </form>
           <span className="legend">
-            {types.map(t => <span key={t.apiName}><i style={{ background: color(t.apiName) }} />{t.apiName}</span>)}
+            {types.map(ot => <span key={ot.apiName}><i style={{ background: color(ot.apiName) }} />{ot.apiName}</span>)}
             {legend.map(([label, s]) => <span key={s} className={`status-${s}`}>{label}</span>)}
           </span>
         </div>
@@ -148,12 +150,12 @@ export function ExploreView({ project, focus, navigate }: { project: string; foc
           </ul>
         )}
         <Loading error={error ?? schema.error} loading={schema.loading && !schema.data} />
-        {truncated && <p className="muted">Showing the first 2000 objects; filter by type or search to narrow down.</p>}
-        <div ref={container} className="canvas" role="img" aria-label="Instance graph. Click a node for details, double-click to expand its neighbours." />
-        <p className="muted">Click a node for details · double-click to expand neighbours · scroll to zoom</p>
+        {truncated && <p className="muted">{tr('truncated')}</p>}
+        <div ref={container} className="canvas" role="img" aria-label={tr('instanceGraphLabel')} />
+        <p className="muted">{tr('instanceHint')}</p>
       </div>
       <aside className="side-col">
-        {selected ? <ItemPanel project={project} id={selected} navigate={navigate} /> : <p className="muted">Select an object.</p>}
+        {selected ? <ItemPanel project={project} id={selected} navigate={navigate} /> : <p className="muted">{tr('selectAnObject')}</p>}
       </aside>
     </div>
   )

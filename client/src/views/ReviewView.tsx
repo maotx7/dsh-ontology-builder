@@ -6,10 +6,12 @@ import { useMemo, useState } from 'react'
 import type { Review, ReviewItem } from '../api'
 import type { Navigate } from '../App'
 import { useApi } from '../hooks'
+import { useT } from '../i18n'
 import { AskButton, Loading, formatValue } from '../ui'
 import { ItemPanel } from './ItemPanel'
 
 export function ReviewView({ project, selected, navigate }: { project: string; selected?: string; navigate: Navigate }) {
+  const t = useT()
   const { data, error, loading } = useApi<Review>('review', { project })
   const [checked, setChecked] = useState<Set<string>>(new Set())
   const [filter, setFilter] = useState<'all' | 'ready' | 'blocked'>('all')
@@ -38,25 +40,25 @@ export function ReviewView({ project, selected, navigate }: { project: string; s
   return (
     <div className="view split">
       <div className="main-col">
-        {!data.published && <p className="error">No published schema yet; candidates cannot be checked or confirmed until one is published.</p>}
+        {!data.published && <p className="error">{t('noPublished')}</p>}
         <div className="toolbar">
-          <span>{data.items.length} candidates</span>
+          <span>{t('candidatesCount', { count: data.items.length })}</span>
           <label>
-            Show{' '}
+            {t('show')}{' '}
             <select value={filter} onChange={e => setFilter(e.target.value as typeof filter)}>
-              <option value="all">all</option>
-              <option value="ready">ready to confirm</option>
-              <option value="blocked">blocked</option>
+              <option value="all">{t('all')}</option>
+              <option value="ready">{t('ready')}</option>
+              <option value="blocked">{t('blocked')}</option>
             </select>
           </label>
           <AskButton
-            label={`Copy confirm request (${chosen.length})`}
+            label={t('copyConfirmRequest', { count: chosen.length })}
             text={`Preview and then confirm these ${chosen.length} candidates in ontology project ${project} as one batch: ${chosen.join(', ')}`}
           />
-          <AskButton label={`Copy reject request (${chosen.length})`} text={`Reject these candidates in ontology project ${project}: ${chosen.join(', ')}. Reason: `} />
+          <AskButton label={t('copyRejectRequest', { count: chosen.length })} text={`Reject these candidates in ontology project ${project}: ${chosen.join(', ')}. ${t('reasonPrefix')}`} />
         </div>
-        <p className="muted">The UI is read-only. Copy a request, paste it into DSH chat, and approve it there — every change is recorded with your approval.</p>
-        {!data.items.length && <p className="empty">Nothing to review.</p>}
+        <p className="muted">{t('readOnlyHint')}</p>
+        {!data.items.length && <p className="empty">{t('noCandidates')}</p>}
         {groups.map(([key, items]) => (
           <table key={key} className="review-table">
             <caption>
@@ -64,13 +66,13 @@ export function ReviewView({ project, selected, navigate }: { project: string; s
                 <input type="checkbox" checked={items.every(i => checked.has(i.id))} onChange={e => toggle(items.map(i => i.id), e.target.checked)} /> {key} ({items.length})
               </label>
             </caption>
-            <thead><tr><th scope="col"><span className="sr-only">Select</span></th><th scope="col">Item</th><th scope="col">Checks</th></tr></thead>
+            <thead><tr><th scope="col"><span className="sr-only">{t('selectLabel')}</span></th><th scope="col">{t('item')}</th><th scope="col">{t('checks')}</th></tr></thead>
             <tbody>
               {items.map(i => (
                 <tr key={i.id} className={i.id === selected ? 'selected' : undefined}>
-                  <td><input type="checkbox" aria-label={`Select ${i.label}`} checked={checked.has(i.id)} onChange={e => toggle([i.id], e.target.checked)} /></td>
+                  <td><input type="checkbox" aria-label={`${t('selectLabel')} ${i.label}`} checked={checked.has(i.id)} onChange={e => toggle([i.id], e.target.checked)} /></td>
                   <td><button type="button" className="link" onClick={() => navigate({ tab: 'review', item: i.id })}>{i.label}</button></td>
-                  <td>{blocking(i) ? <span className="sev-blocking">{i.issues.filter(x => x.severity === 'blocking').map(x => x.code).join(', ')}</span> : <span className="ok">ready</span>}</td>
+                  <td>{blocking(i) ? <span className="sev-blocking">{i.issues.filter(x => x.severity === 'blocking').map(x => x.code).join(', ')}</span> : <span className="ok">{t('readyBadge')}</span>}</td>
                 </tr>
               ))}
             </tbody>
@@ -79,7 +81,7 @@ export function ReviewView({ project, selected, navigate }: { project: string; s
 
         {data.conflicts.length > 0 && (
           <section>
-            <h3>Open conflicts ({data.conflicts.length})</h3>
+            <h3>{t('openConflictsCount', { count: data.conflicts.length })}</h3>
             <ul>
               {data.conflicts.map(c => (
                 <li key={c.id}>
@@ -91,12 +93,12 @@ export function ReviewView({ project, selected, navigate }: { project: string; s
         )}
         {data.samples.length > 0 && (
           <section>
-            <h3>Rule spot checks waiting ({data.samples.length})</h3>
+            <h3>{t('ruleSamplesWaiting', { count: data.samples.length })}</h3>
             <ul>
               {data.samples.map(s => (
                 <li key={s.ruleId + s.targetId}>
                   <button type="button" className="link" onClick={() => navigate({ tab: 'review', item: s.targetId })}>{s.targetId}</button> (rule <code>{s.ruleId}</code>){' '}
-                  <AskButton label="Copy judge request" text={`Judge rule ${s.ruleId} spot check ${s.targetId} in ontology project ${project} as correct/wrong: `} />
+                  <AskButton label={t('copyJudgeRequest')} text={`Judge rule ${s.ruleId} spot check ${s.targetId} in ontology project ${project} as correct/wrong: `} />
                 </li>
               ))}
             </ul>
@@ -104,17 +106,17 @@ export function ReviewView({ project, selected, navigate }: { project: string; s
         )}
         {data.rules.length > 0 && (
           <section>
-            <h3>Rules</h3>
+            <h3>{t('rules')}</h3>
             <ul>
               {data.rules.map(r => (
-                <li key={r.id}><code>{r.id}</code> {r.definition.name} — {r.status}, {r.stats.confirmed} confirmed, {r.stats.judged} judged{r.stats.accuracy !== null && `, accuracy ${(r.stats.accuracy * 100).toFixed(0)}%`}</li>
+                <li key={r.id}><code>{r.id}</code> {t('ruleSummary', { name: r.definition.name, status: r.status, confirmed: r.stats.confirmed, judged: r.stats.judged, accuracy: r.stats.accuracy === null ? '—' : `${(r.stats.accuracy * 100).toFixed(0)}%` })}</li>
               ))}
             </ul>
           </section>
         )}
       </div>
       <aside className="side-col">
-        {selected ? <ItemPanel project={project} id={selected} issues={current?.issues} navigate={navigate} /> : <p className="muted">Select a candidate to see its evidence.</p>}
+        {selected ? <ItemPanel project={project} id={selected} issues={current?.issues} navigate={navigate} /> : <p className="muted">{t('selectCandidate')}</p>}
       </aside>
     </div>
   )
