@@ -199,8 +199,8 @@ function TypeDetail({ type, schema, changed, onSelect, onClose }: { type: Object
   const links = schema.linkTypes.filter(l => l.from === type.apiName || l.to === type.apiName)
   const questions = schema.questions.filter(q => type.questions?.includes(q.id))
   return (
-    <section className="panel" aria-label={t('typeDetailsLabel')}>
-      <div className="panel-head">
+    <section className="ontology-detail" aria-label={t('typeDetailsLabel')}>
+      <div className="ontology-detail-head">
         <h2>
           {type.displayName && type.displayName !== type.apiName ? (
             <>

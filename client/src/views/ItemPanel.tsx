@@ -17,7 +17,7 @@ export function ItemPanel({ project, id, issues = [], navigate }: { project: str
   }
   const title = 'key' in r ? `${r.type} · ${r.key}` : 'linkType' in r ? `${r.linkType}: ${name(r.fromId)} → ${name(r.toId)}` : `${r.relation}: ${name(r.objectId)} → ${r.codeRef}`
   return (
-    <section className="panel" aria-label={t('itemDetailsLabel')}>
+    <section className="ontology-detail" aria-label={t('itemDetailsLabel')}>
       <h2>{title} <StatusBadge status={r.status} /></h2>
       <p className="muted"><code>{r.id}</code> · {t('batch')} <code>{r.batchId}</code></p>
       {data.endpoints.length > 0 && (
