@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { chunkText } from '../dist/extract/chunk.js'
-import { checkSubmission, extractChunk, systemPrompt } from '../dist/extract/extract.js'
+import { checkSubmission, diagnose, extractChunk, systemPrompt } from '../dist/extract/extract.js'
 
 const SCHEMA = {
   questions: [],
@@ -75,10 +75,37 @@ test('extraction retries with the problems and keeps the best attempt', async ()
   assert.match(seen[1].turns[2].text, /Ada was hired/)
 })
 
-test('extraction gives up after maxAttempts and reports what is left', async () => {
+test('extraction stops early when the model chats instead of calling the tool', async () => {
   const model = async () => ({ text: 'I think Ada works at Acme.' })
-  const r = await extractChunk({ model, schema: SCHEMA, chunk, materialId: 'm', materialName: 'doc', maxAttempts: 2 })
+  const r = await extractChunk({ model, schema: SCHEMA, chunk, materialId: 'm', materialName: 'doc', maxAttempts: 3 })
   assert.equal(r.attempts, 2)
   assert.deepEqual(r.objects, [])
-  assert.match(r.problems[0], /calling submit_extraction/)
+  assert.match(r.problems[0], /hijacked by the template/)
+})
+
+test('diagnose flags a reasoning-heavy call cut by max-tokens', () => {
+  const d = diagnose({ text: '', diagnostics: { finishReason: 'max-tokens', reasoningChars: 1200, reasoningTokens: 900, toolCallAttempted: false } }, 1, 16000)
+  assert.equal(d.fatal, true)
+  assert.match(d.problem, /Reasoning\/budget problem/)
+  assert.match(d.problem, /reasoningEffort/)
+})
+
+test('diagnose flags a hijacked tool call after consecutive text-only turns', () => {
+  const d = diagnose({ text: 'here is some prose', diagnostics: { finishReason: 'stop', textChars: 20, toolCallAttempted: false } }, 2, 16000)
+  assert.equal(d.fatal, true)
+  assert.match(d.problem, /hijacked by the template/)
+  assert.match(d.problem, /chat_template/)
+})
+
+test('a max-tokens cut retries once with a larger budget', async () => {
+  const budgets = []
+  const model = async req => {
+    budgets.push(req.maxTokens)
+    if (budgets.length === 1) return { text: '', diagnostics: { finishReason: 'max-tokens', outputTokens: 16000, toolCallAttempted: false } }
+    return { call: { objects: [{ type: 'Person', properties: { name: 'Ada' }, quote: 'Ada is an engineer' }], links: [] } }
+  }
+  const r = await extractChunk({ model, schema: SCHEMA, chunk, materialId: 'm', materialName: 'doc', maxAttempts: 3, maxTokens: 16000 })
+  assert.deepEqual(budgets, [16000, 24000])
+  assert.equal(r.attempts, 2)
+  assert.equal(r.objects.length, 1)
 })

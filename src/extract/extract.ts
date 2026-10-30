@@ -12,10 +12,23 @@ import type { Chunk } from './chunk.js'
 export const PROMPT_VERSION = 'extract-v1'
 
 /** One model turn. `call` is the submitted arguments (already JSON-parsed) or undefined if the model did not call the tool. */
-export interface ModelReply { call?: unknown; text: string }
+export interface ExtractionDiagnostics {
+  /** Normalized finish reason from the host: 'stop' | 'tool-calls' | 'max-tokens' | 'aborted' | 'error' | … */
+  finishReason?: string
+  /** Reasoning (thinking) characters the model streamed before any tool call. */
+  reasoningChars?: number
+  /** True when the model emitted any tool call, even with the wrong name or unparseable arguments. */
+  toolCallAttempted?: boolean
+  /** Visible (non-reasoning) text characters. */
+  textChars?: number
+  /** Provider-reported token usage when the host emits it. */
+  outputTokens?: number
+  reasoningTokens?: number
+}
+export interface ModelReply { call?: unknown; text: string; diagnostics?: ExtractionDiagnostics }
 export interface Turn { role: 'user' | 'assistant'; text: string }
 /** Provided by the host: run one model request with the given system prompt, conversation and single tool. */
-export type ModelFn = (request: { system: string; turns: Turn[]; tool: { name: string; description: string; parameters: Record<string, unknown> }; signal?: AbortSignal }) => Promise<ModelReply>
+export type ModelFn = (request: { system: string; turns: Turn[]; tool: { name: string; description: string; parameters: Record<string, unknown> }; maxTokens?: number; signal?: AbortSignal }) => Promise<ModelReply>
 
 export interface ChunkResult {
   chunk: Chunk
@@ -140,23 +153,78 @@ export function checkSubmission(schema: OntologySchema, chunk: Chunk, materialId
   return { objects, links, problems }
 }
 
+/** Output budgets are raised once by this factor when a call is cut by max-tokens. */
+const ESCALATE_FACTOR = 1.5
+const MAX_ESCALATED_TOKENS = 32000
+
+/**
+ * Classify a failed model reply into an actionable message, and whether retrying
+ * with the same setup can help. The two signatures cover the failures that cost
+ * the most debugging time: a reasoning-heavy call that never reaches the tool, and
+ * a chat template that suppresses tool calls entirely.
+ */
+export function diagnose(reply: ModelReply, noToolCallStreak: number, budget: number): { problem: string; fatal: boolean } {
+  const d = reply.diagnostics
+  if (d?.finishReason === 'max-tokens') {
+    const thinking = (d.reasoningTokens ?? 0) > 0 || (d.reasoningChars ?? 0) > 0
+    if (thinking && d.toolCallAttempted !== true) {
+      return {
+        problem: `Reasoning/budget problem: the model hit finish_reason=max-tokens while still emitting reasoning (reasoningTokens=${d.reasoningTokens ?? 0}, reasoningChars=${d.reasoningChars ?? 0}) and never called submit_extraction. Declare a reasoningEffort for this model (map the "off" setting), or raise extraction.maxTokens (current ${budget}).`,
+        fatal: true
+      }
+    }
+    return {
+      problem: `Budget problem: output was cut at maxTokens=${budget} (finish_reason=max-tokens), so the tool arguments are incomplete or missing. Raise extraction.maxTokens.`,
+      fatal: false
+    }
+  }
+  if (noToolCallStreak >= 2) {
+    return {
+      problem: `The model's tool call is being hijacked by the template: ${noToolCallStreak} turns produced content but no submit_extraction tool call. Do not disable thinking/tool-calling via chat_template; use the native tool-call channel.`,
+      fatal: true
+    }
+  }
+  return { problem: 'Answer by calling submit_extraction, not with text.', fatal: false }
+}
+
 /** Extract from one chunk, retrying with the validation errors until clean or out of attempts. */
-export async function extractChunk(opts: { model: ModelFn; schema: OntologySchema; chunk: Chunk; materialId: string; materialName: string; instructions?: string; maxAttempts: number; signal?: AbortSignal }): Promise<ChunkResult> {
+export async function extractChunk(opts: { model: ModelFn; schema: OntologySchema; chunk: Chunk; materialId: string; materialName: string; instructions?: string; maxAttempts: number; maxTokens?: number; signal?: AbortSignal }): Promise<ChunkResult> {
   const system = systemPrompt(opts.schema, opts.instructions)
   const turns: Turn[] = [{ role: 'user', text: userPrompt(opts.chunk, opts.materialName) }]
   let best: ReturnType<typeof checkSubmission> = { objects: [], links: [], problems: ['The model did not call submit_extraction.'] }
   let output: unknown = null
   let attempts = 0
+  let budget = opts.maxTokens ?? 8192
+  let escalated = false
+  let noToolCallStreak = 0
   while (attempts < opts.maxAttempts) {
     attempts++
     opts.signal?.throwIfAborted()
-    const reply = await opts.model({ system, turns, tool: SUBMIT_TOOL as unknown as { name: string; description: string; parameters: Record<string, unknown> }, signal: opts.signal })
+    const reply = await opts.model({
+      system, turns,
+      tool: SUBMIT_TOOL as unknown as { name: string; description: string; parameters: Record<string, unknown> },
+      ...(opts.maxTokens !== undefined || escalated ? { maxTokens: budget } : {}),
+      signal: opts.signal
+    })
     output = reply.call ?? reply.text
-    const checked = reply.call === undefined ? { objects: [], links: [], problems: ['Answer by calling submit_extraction, not with text.'] } : checkSubmission(opts.schema, opts.chunk, opts.materialId, reply.call)
+    const noCall = reply.call === undefined
+    const hasContent = !!(reply.text && reply.text.trim()) || (reply.diagnostics?.textChars ?? 0) > 0 || (reply.diagnostics?.reasoningChars ?? 0) > 0
+    noToolCallStreak = noCall && reply.diagnostics?.toolCallAttempted !== true ? (hasContent ? noToolCallStreak + 1 : 0) : 0
+    const diag = noCall ? diagnose(reply, noToolCallStreak, budget) : undefined
+    const checked = noCall ? { objects: [], links: [], problems: [diag!.problem] } : checkSubmission(opts.schema, opts.chunk, opts.materialId, reply.call)
     // Keep the attempt that produced the most usable items.
     if (attempts === 1 || checked.objects.length + checked.links.length >= best.objects.length + best.links.length) best = checked
     if (!checked.problems.length) break
-    turns.push({ role: 'assistant', text: reply.call === undefined ? reply.text : `submit_extraction(${JSON.stringify(reply.call)})` })
+    // A call cut by max-tokens gets one retry with a larger budget before giving up.
+    if (diag && reply.diagnostics?.finishReason === 'max-tokens' && !escalated && opts.maxTokens !== undefined && budget < MAX_ESCALATED_TOKENS) {
+      budget = Math.min(Math.round(budget * ESCALATE_FACTOR), MAX_ESCALATED_TOKENS)
+      escalated = true
+      turns.push({ role: 'assistant', text: reply.text })
+      turns.push({ role: 'user', text: 'Your previous answer was cut off by the token limit. Continue from where it stopped and call submit_extraction with the complete list.' })
+      continue
+    }
+    if (diag?.fatal) break
+    turns.push({ role: 'assistant', text: noCall ? reply.text : `submit_extraction(${JSON.stringify(reply.call)})` })
     turns.push({ role: 'user', text: `Your submission had problems:\n- ${checked.problems.join('\n- ')}\nCall submit_extraction again with the full corrected list. Items you cannot support with an exact quote should be left out.` })
   }
   return { chunk: opts.chunk, objects: best.objects, links: best.links, attempts, problems: best.problems, output }

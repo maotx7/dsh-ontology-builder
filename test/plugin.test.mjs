@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as plugin from '../dist/index.js'
 
@@ -71,7 +71,7 @@ test('exports a Cordis plugin shape', () => {
   assert.equal(plugin.name, 'ontology-builder')
   assert.deepEqual(plugin.inject, ['tools', 'approval', 'llm', 'agentDefaultModel'])
   assert.equal(typeof plugin.apply, 'function')
-  assert.equal(plugin.Config({}).databasePath, 'ontology-builder.db')
+  assert.equal(plugin.Config({}).databasePath, join(homedir(), '.dsh', 'ontology-builder', 'ontology-builder.db'))
 })
 
 test('end-to-end build through the tools', withWorkspace(async dir => {

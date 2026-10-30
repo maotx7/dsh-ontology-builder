@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { dirname, resolve } from 'node:path'
+import { homedir } from 'node:os'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
@@ -20,7 +21,7 @@ export const name = 'ontology-builder'
 export const inject = ['tools', 'approval', 'llm', 'agentDefaultModel']
 
 export interface Config {
-  /** SQLite database file for ontology projects. Relative paths resolve against the DSH working directory. */
+  /** SQLite database file for ontology projects. Defaults to a fixed folder under `~/.dsh/ontology-builder` so every DSH session shares one file; `~` is expanded, and a bare relative path still resolves against the DSH working directory. */
   databasePath: string
   extraction: {
     /** Characters per chunk sent to the model. */
@@ -37,13 +38,13 @@ export interface Config {
 }
 
 export const Config: Schema<Config> = Schema.object({
-  databasePath: Schema.string().default('ontology-builder.db').description('SQLite database file for ontology projects.'),
+  databasePath: Schema.string().default(join(homedir(), '.dsh', 'ontology-builder', 'ontology-builder.db')).description('SQLite database file for ontology projects. Defaults to a fixed folder under ~/.dsh/ontology-builder so every DSH session shares one file; ~ is expanded, and a bare relative path still resolves against the DSH working directory.'),
   extraction: Schema.object({
     chunkChars: Schema.natural().min(200).default(4000).description('Characters per chunk sent to the model.'),
     overlapChars: Schema.natural().default(300).description('Characters shared by consecutive chunks.'),
     maxAttempts: Schema.natural().min(1).max(5).default(3).description('Model attempts per chunk, including corrections.'),
     maxChunks: Schema.natural().min(1).default(20).description('Chunks per ontology_extract call.'),
-    maxTokens: Schema.natural().min(256).default(8192).description('Output token cap per model call.')
+    maxTokens: Schema.natural().min(256).default(16000).description('Output token cap per model call.')
   }).default({} as Config['extraction'])
 })
 
@@ -63,10 +64,16 @@ export function apply(ctx: Context, config: Config) {
   const services = ctx as unknown as { tools: ToolRegistry; approval: Approval; llm: Llm; agentDefaultModel: { currentSelection(): ModelSelection } }
   const workspace = process.cwd()
   let store: Store | undefined
+  /** One fixed database location regardless of where DSH is started: `~` and `~/…` expand to the home directory, absolute paths are used as-is, and only a bare relative path stays anchored to the DSH working directory. */
+  const dbPath = (configured: string) => {
+    if (configured === '~') return homedir()
+    if (configured.startsWith('~/')) return join(homedir(), configured.slice(2))
+    return isAbsolute(configured) ? configured : resolve(workspace, configured)
+  }
   // Opened on first use so loading the plugin never touches the disk.
   const open = () => {
     if (!store) {
-      const path = resolve(workspace, config.databasePath)
+      const path = dbPath(config.databasePath)
       mkdirSync(dirname(path), { recursive: true })
       store = new Store(path)
     }

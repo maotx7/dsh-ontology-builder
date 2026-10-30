@@ -32,7 +32,7 @@ export interface ToolEnv {
   approval: Approval
   /** The configured DSH model, or undefined when the host has no LLM service. */
   model?: ModelFn & { selection(): { provider: string; model: string } }
-  extraction: { chunkChars: number; overlapChars: number; maxAttempts: number; maxChunks: number }
+  extraction: { chunkChars: number; overlapChars: number; maxAttempts: number; maxChunks: number; maxTokens: number }
   /** Directory that file paths resolve against and must stay inside. */
   workspace: string
 }
@@ -346,7 +346,7 @@ export function createTools(env: ToolEnv): ToolSpec[] {
     },
     {
       name: 'ontology_extract',
-      description: 'Extract candidates from stored materials with the model configured in DSH, against the published schema. Each chunk is answered through a validated tool call; quotes not found verbatim are sent back for correction, then dropped. Results become one batch of candidates (never confirmed). Use dryRun first on a large material to see the chunk count.',
+      description: 'Extract candidates from stored materials with the model configured in DSH, against the published schema. Each chunk is answered through a validated tool call; quotes not found verbatim are sent back for correction, then dropped. Results become one batch of candidates (never confirmed). Use dryRun first on a large material to see the chunk count. Before the batch, the first chunk is tried as a preflight so a broken channel fails fast instead of after many chunks.',
       timeoutMs: 30 * 60 * 1000,
       parameters: obj({
         project,
@@ -354,7 +354,8 @@ export function createTools(env: ToolEnv): ToolSpec[] {
         instructions: str('Optional project-specific guidance for the extractor, e.g. naming conventions.'),
         fromChunk: { type: 'integer', description: 'Resume at this chunk index (per material). Default 0.' },
         maxChunks: { type: 'integer', description: 'Chunks to process in this call (default from config).' },
-        dryRun: { type: 'boolean', description: 'Only report the chunk plan; no model calls.' }
+        dryRun: { type: 'boolean', description: 'Only report the chunk plan; no model calls.' },
+        noPreflight: { type: 'boolean', description: 'Skip the first-chunk preflight and run the batch directly.' }
       }, ['project', 'materialIds']),
       async execute(args, exec) {
         const s = store()
@@ -372,20 +373,40 @@ export function createTools(env: ToolEnv): ToolSpec[] {
         if (!env.model) throw new Error('This DSH profile has no model service (ctx.llm); extraction is unavailable.')
         const model = env.model
         const { provider, model: modelId } = model.selection()
+        const instructions = args.instructions ? String(args.instructions) : undefined
         const objects: ObjectInput[] = [], links: LinkInput[] = [], runs: ExtractionRun[] = [], problems: Array<{ materialId: string; chunk: number; problems: string[] }> = []
+        const record = (r: Awaited<ReturnType<typeof extractChunk>>, materialId: string) => {
+          objects.push(...r.objects)
+          links.push(...r.links)
+          if (r.problems.length) problems.push({ materialId, chunk: r.chunk.index, problems: r.problems })
+          runs.push({ materialId, chunkStart: r.chunk.start, chunkEnd: r.chunk.end, chunkSha256: sha256(r.chunk.text), promptVersion: PROMPT_VERSION, provider, model: modelId, attempts: r.attempts, output: r.output, problems: r.problems })
+        }
         let used = 0
         const next: Array<{ materialId: string; fromChunk: number }> = []
+        // Preflight: extract the first chunk alone so a broken channel fails fast.
+        let preflight: { materialId: string; chunk: number } | undefined
+        if (!args.noPreflight) {
+          const first = plan[0]?.chunks[from]
+          if (first) {
+            exec.signal?.throwIfAborted()
+            const r = await extractChunk({ model, schema: published.schema, chunk: first, materialId: plan[0].material.id, materialName: plan[0].material.name, instructions, maxAttempts: cfg.maxAttempts, maxTokens: cfg.maxTokens, signal: exec.signal })
+            if (!r.objects.length && !r.links.length && r.problems.length) {
+              return { preflight: 'failed', materialId: plan[0].material.id, chunk: first.index, diagnostics: r.problems, suggestion: 'Fix the extraction channel (see diagnostics) before running the full batch.', materials: planned, budget }
+            }
+            record(r, plan[0].material.id)
+            used = 1
+            preflight = { materialId: plan[0].material.id, chunk: first.index }
+          }
+        }
         for (const { material, chunks } of plan) {
-          const todo = chunks.slice(from)
+          const startAt = preflight && material.id === preflight.materialId ? preflight.chunk + 1 : from
+          const todo = chunks.slice(startAt)
           for (const chunk of todo) {
             if (used >= budget) { next.push({ materialId: material.id, fromChunk: chunk.index }); break }
             exec.signal?.throwIfAborted()
             used++
-            const r = await extractChunk({ model, schema: published.schema, chunk, materialId: material.id, materialName: material.name, instructions: args.instructions ? String(args.instructions) : undefined, maxAttempts: cfg.maxAttempts, signal: exec.signal })
-            objects.push(...r.objects)
-            links.push(...r.links)
-            if (r.problems.length) problems.push({ materialId: material.id, chunk: chunk.index, problems: r.problems })
-            runs.push({ materialId: material.id, chunkStart: chunk.start, chunkEnd: chunk.end, chunkSha256: sha256(chunk.text), promptVersion: PROMPT_VERSION, provider, model: modelId, attempts: r.attempts, output: r.output, problems: r.problems })
+            const r = await extractChunk({ model, schema: published.schema, chunk, materialId: material.id, materialName: material.name, instructions, maxAttempts: cfg.maxAttempts, maxTokens: cfg.maxTokens, signal: exec.signal })
+            record(r, material.id)
           }
         }
         // Objects first so links in the same batch can resolve their endpoints.

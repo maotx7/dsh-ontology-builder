@@ -26,6 +26,8 @@ export interface QualityReport {
     droppedByValidation: number
     codeLinks: { candidate: number; confirmed: number; stale: number }
   }
+  /** Objects with no active link at all — candidate loose ends to wire up, plus confirmed gaps. */
+  orphans: { candidates: number; confirmed: number; byType: Record<string, number> }
   method: string
 }
 
@@ -99,6 +101,15 @@ export function qualityReport(store: Store, projectId: string): QualityReport {
   const rules = store.rules(projectId).map(r => ({ id: r.id, name: r.definition.name, status: r.status, confirmed: r.stats.confirmed, judged: r.stats.judged, accuracy: r.stats.accuracy }))
   for (const r of rules) if (r.status === 'active' && r.accuracy !== null && r.judged > 0 && r.accuracy < 0.9) evidence.push(issue('warning', 'RULE_ACCURACY', r.id, `Rule "${r.name}" spot-check accuracy is ${(r.accuracy * 100).toFixed(0)}%.`))
 
+  const linkedIds = new Set(allLinks.filter(l => l.status !== 'rejected').flatMap(l => [l.fromId, l.toId]))
+  const orphanByType: Record<string, number> = {}
+  let orphanConfirmed = 0
+  for (const o of all) {
+    if (linkedIds.has(o.id)) continue
+    if (o.status === 'confirmed') orphanConfirmed++
+    else if (o.status === 'candidate') orphanByType[o.type] = (orphanByType[o.type] ?? 0) + 1
+  }
+
   const everything = [...structure, ...logic, ...evidence, ...smells, ...questionIssues]
   const count = (sev: Issue['severity']) => everything.filter(i => i.severity === sev).length
   return {
@@ -116,6 +127,7 @@ export function qualityReport(store: Store, projectId: string): QualityReport {
       droppedByValidation: store.droppedByValidation(projectId),
       codeLinks: { candidate: codeLinks.filter(l => l.status === 'candidate').length, confirmed: codeLinks.filter(l => l.status === 'confirmed').length, stale: codeLinks.filter(l => l.stale).length }
     },
+    orphans: { candidates: Object.values(orphanByType).reduce((a, b) => a + b, 0), confirmed: orphanConfirmed, byType: orphanByType },
     method: METHOD
   }
 }
